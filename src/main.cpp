@@ -18,6 +18,10 @@ const char *password = SECRET_WIFI_PASS;
 WiFiClientSecure client;
 UniversalTelegramBot bot(BOTtoken, client);
 
+// Avvio di Telnet
+WiFiServer telnetServer(23); // Porta Telnet
+WiFiClient telnetClient;
+
 int botRequestDelay = 3000;       // Tempo minimo tra due controlli per nuovi messaggi da Telegram
 unsigned long lastTimeBotRan = 0; // Memorizza l’ultima volta in cui il bot ha controllato nuovi messaggi
 
@@ -25,19 +29,19 @@ unsigned long lastTimeBotRan = 0; // Memorizza l’ultima volta in cui il bot ha
 void debugPrint(const String &msg)
 {
   Serial.print(msg);
-  /* if (telnetClient && telnetClient.connected())
+  if (telnetClient && telnetClient.connected())
   {
     telnetClient.print(msg);
-  } */
+  } 
 }
 
 void debugPrintln(const String &msg)
 {
   Serial.println(msg);
-  /* if (telnetClient && telnetClient.connected())
+  if (telnetClient && telnetClient.connected())
   {
     telnetClient.println(msg);
-  } */
+  }
 }
 
 void setup()
@@ -73,6 +77,10 @@ void setup()
   ArduinoOTA.setHostname("esp32-ota");
   ArduinoOTA.begin();
 
+  // Avvio modalita TELNET
+  telnetServer.begin(); // Avvia server Telnet
+  telnetServer.setNoDelay(true);
+
   // dopo che il WiFi è connesso
   debugPrintln("Imposto orario NTP...");
   configTime(0, 0, "pool.ntp.org", "time.nist.gov"); // UTC [web:106]
@@ -100,5 +108,16 @@ void loop()
       }
     }
     lastTimeBotRan = now;
+  }
+
+  // Gestione nuove connessioni Telnet
+  if (telnetServer.hasClient())
+  {
+    if (telnetClient && telnetClient.connected())
+    {
+      telnetClient.stop();
+    }
+    telnetClient = telnetServer.available();
+    debugPrintln("Client Telnet connesso");
   }
 }
