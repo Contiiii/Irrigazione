@@ -25,6 +25,10 @@ WiFiClient telnetClient;
 int botRequestDelay = 3000;       // Tempo minimo tra due controlli per nuovi messaggi da Telegram
 unsigned long lastTimeBotRan = 0; // Memorizza l’ultima volta in cui il bot ha controllato nuovi messaggi
 
+//inizializzo varibili per debug e manutenzione
+bool manutenzione = false;
+bool debug = false;
+
 // ---- FUNZIONI DI DEBUG (Serial + Telnet) ----
 void debugPrint(const String &msg)
 {
@@ -88,6 +92,42 @@ void setup()
   debugPrintln("ArduinoOTA pronto");
 }
 
+void handleMessage(String text){
+  text.trim(); // togli spazi / \n
+  if (text == "/acceso")
+  {
+    /* handleAcceso(); */
+  }
+  else if (text == "/spento")
+  {
+    /* handleSpento(); */
+  }
+  else if (text == "/stato")
+  {
+    /* handleStato(); */
+  }
+  else if (text == "/meteo")
+  {
+    /* handleMeteo(); */
+  }
+  else if (text == "/sensore")
+  {
+    /* handleSensore(); */
+  }
+  else if (text == "/debug")
+  {
+    /* handleDebug(); */
+  }
+  else if (text == "/manutenzione")
+  {
+    /* handleManutenzione(); */
+  }
+  else
+  {
+    debugPrintln("Comando sconosciuto: " + text);
+    bot.sendMessage(CHAT_ID, "Comando non riconosciuto", "");
+  }
+}
 void loop()
 {
    ArduinoOTA.handle();
@@ -105,6 +145,7 @@ void loop()
         String text = bot.messages[i].text;
         debugPrint("Messaggio: ");
         debugPrintln(text);
+        handleMessage(text);
       }
     }
     lastTimeBotRan = now;
