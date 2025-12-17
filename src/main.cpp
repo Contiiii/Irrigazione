@@ -6,6 +6,13 @@
 
 #include "secrets.h"
 
+// Pin utilizzati
+#define Pin_SensoreContenitore 34
+#define Pin_Sensore1 33
+#define Pin_Sensore2 32
+#define Pin_Relay1 18
+#define Pin_Relay2 19
+
 // Dati WiFi
 const char *ssid = SECRET_WIFI_SSID;
 const char *password = SECRET_WIFI_PASS;
@@ -25,7 +32,7 @@ WiFiClient telnetClient;
 int botRequestDelay = 3000;       // Tempo minimo tra due controlli per nuovi messaggi da Telegram
 unsigned long lastTimeBotRan = 0; // Memorizza l’ultima volta in cui il bot ha controllato nuovi messaggi
 
-//inizializzo varibili per debug e manutenzione
+// inizializzo varibili per debug e manutenzione
 bool manutenzione = false;
 bool debug = false;
 
@@ -36,7 +43,7 @@ void debugPrint(const String &msg)
   if (telnetClient && telnetClient.connected())
   {
     telnetClient.print(msg);
-  } 
+  }
 }
 
 void debugPrintln(const String &msg)
@@ -54,6 +61,12 @@ void setup()
   delay(100);
 
   debugPrintln("Boot ESP32...");
+
+  pinMode(Pin_SensoreContenitore, INPUT_PULLUP);
+  pinMode(Pin_Sensore1, INPUT);
+  pinMode(Pin_Sensore2, INPUT);
+  pinMode(Pin_Relay1, OUTPUT);
+  pinMode(Pin_Relay2, OUTPUT);
 
   // Avvio wifi
   debugPrint("Connessione a ");
@@ -74,7 +87,7 @@ void setup()
   // Certificato root per Telegram HTTPS
   client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
 
-// Messaggio di avvio
+  // Messaggio di avvio
   bot.sendMessage(CHAT_ID, "BOT ATTIVO!", "");
 
   // Avvio modalita OTA
@@ -92,7 +105,36 @@ void setup()
   debugPrintln("ArduinoOTA pronto");
 }
 
-void handleMessage(String text){
+void handleSensore(int umidita[2])
+{
+  umidita[0] = analogRead(Pin_Sensore1);
+  umidita[1] = analogRead(Pin_Sensore2);
+
+  if (debug)
+  {
+    bot.sendMessage(CHAT_ID, "umidità: " + String(umidita[0]) + ", " + String(umidita[1]));
+
+    
+  }
+  debugPrintln("umidità: " + String(umidita[0]) + ", " + String(umidita[1]));
+}
+
+void handleDebug(){
+  debug = !debug;
+  if(debug){
+    bot.sendMessage(CHAT_ID, "Ho attivato la modalita DEBUG!");
+
+    debugPrintln("Ho attivato la modalita DEBUG!");
+  }
+  else{
+    bot.sendMessage(CHAT_ID, "Ho disattivato la modalita DEBUG!");
+
+    debugPrintln("Ho disattivato la modalita DEBUG!");
+  }
+}
+
+void handleMessage(String text)
+{
   text.trim(); // togli spazi / \n
   if (text == "/acceso")
   {
@@ -112,11 +154,12 @@ void handleMessage(String text){
   }
   else if (text == "/sensore")
   {
-    /* handleSensore(); */
+    int umidita[2];
+    handleSensore(umidita);
   }
   else if (text == "/debug")
   {
-    /* handleDebug(); */
+    handleDebug();
   }
   else if (text == "/manutenzione")
   {
@@ -130,7 +173,7 @@ void handleMessage(String text){
 }
 void loop()
 {
-   ArduinoOTA.handle();
+  ArduinoOTA.handle();
 
   // Gestione bot Telegram ogni botRequestDelay ms
   unsigned long now = millis();
