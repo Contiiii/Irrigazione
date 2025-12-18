@@ -8,11 +8,20 @@
 #include "secrets.h"
 
 // Pin utilizzati
+enum BotState {
+  IDLE,
+  ASK_TIME_MOT1,
+  ASK_TIME_MOT2,
+  ASK_TIME_BOTH
+};
+
 #define Pin_SensoreContenitore 34
 #define Pin_Sensore1 33
 #define Pin_Sensore2 32
 #define Pin_Relay1 18
 #define Pin_Relay2 19
+
+BotState botstate = IDLE;
 
 // Dati WiFi
 const char *ssid = SECRET_WIFI_SSID;
@@ -82,7 +91,6 @@ void debugPrintln(const String &msg)
   bot.sendMessage(CHAT_ID, msg);
 }
 
-// DEBUG
 void setup()
 {
   Serial.begin(115200);
@@ -138,6 +146,7 @@ void leggiSensori(int umidita[2])
   umidita[0] = analogRead(Pin_Sensore1);
   umidita[1] = analogRead(Pin_Sensore2);
 }
+
 void handleSensore()
 {
   int umidita[2];
@@ -155,6 +164,53 @@ void handleDebug()
   else
   {
     debugPrintln("Ho disattivato la modalita DEBUG!");
+  }
+}
+
+void askTime(const String &who) {
+  String keyboardJson = F(
+    "[["
+      "{\"text\":\"10s\",\"callback_data\":\"t_10\"},"
+      "{\"text\":\"30s\",\"callback_data\":\"t_30\"}"
+    "],"
+    "["
+      "{\"text\":\"60s\",\"callback_data\":\"t_60\"}"
+    "]]"
+  );
+
+  bot.sendMessageWithInlineKeyboard(
+    CHAT_ID,
+    "Quanto tempo per " + who + "?",
+    "",
+    keyboardJson
+  );
+}
+
+void handleCallBack(String text){
+  if (text == "mot1_on")
+  {
+    botstate = ASK_TIME_MOT1;
+    askTime("motore 1");
+  }
+  else if (text == "mot2_on")
+  {
+    botstate = ASK_TIME_MOT2;
+    askTime("motore 2");
+  }
+  else if (text == "mot_all_on")
+  {
+    botstate = ASK_TIME_BOTH;
+    askTime("entrambi i motori?");
+  }
+
+  else if (text.startsWith("t_"))
+  {
+    int seconds = 0;
+    if(text == "t_10") seconds = 10;
+    else if(text == "t_30") seconds = 30;
+    else if(text == "t_60") seconds = 60;
+    bot.sendMessage(CHAT_ID,"Avvio il motore " + String(botstate) + " per " + String(seconds) + " secondi");
+    botstate = IDLE;
   }
 }
 
@@ -189,12 +245,30 @@ void handleMessage(String text)
   {
     /* handleManutenzione(); */
   }
+  else if (text == "/test")
+  {
+    String keyboardJson = F(
+        "[["
+        "{\"text\":\"Motore 1\",\"callback_data\":\"mot1_on\"},"
+        "{\"text\":\"Motore 2\",\"callback_data\":\"mot2_on\"}"
+        "],"
+        "["
+        "{\"text\":\"Entrambi\",\"callback_data\":\"mot_all_on\"}"
+        "]]");
+
+    bot.sendMessageWithInlineKeyboard(
+        CHAT_ID,
+        "Scegli cosa accendere:",
+        "", // parseMode
+        keyboardJson);
+  }
   else
   {
     debugPrintln("Comando sconosciuto: " + text);
     bot.sendMessage(CHAT_ID, "Comando non riconosciuto", "");
   }
 }
+
 void loop()
 {
   ArduinoOTA.handle();
@@ -209,10 +283,20 @@ void loop()
     {
       for (int i = 0; i < numNewMessages; i++)
       {
-        String text = bot.messages[i].text;
-        debugPrint("Messaggio: ");
-        debugPrintln(text);
-        handleMessage(text);
+        String type = bot.messages[i].type;   // <-- chiave
+
+        if (type == "message") {
+          String text = bot.messages[i].text;
+          debugPrint("Messaggio: ");
+          debugPrintln(text);
+          handleMessage(text);               // /debug, /sensore, /test...
+        }
+        else if (type == "callback_query") {
+          String data = bot.messages[i].text;
+          debugPrint("Callback: ");
+          debugPrintln(data);
+          handleCallBack(data);              // mot1_on, mot2_on, mot_all_on
+        }
       }
     }
     lastTimeBotRan = now;
