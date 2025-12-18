@@ -3,6 +3,7 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoOTA.h>
 #include <UniversalTelegramBot.h>
+#include <time.h>
 
 #include "secrets.h"
 
@@ -37,24 +38,51 @@ bool manutenzione = false;
 bool debug = false;
 
 // ---- FUNZIONI DI DEBUG (Serial + Telnet) ----
-void debugPrint(const String &msg)
+void logPrint(const String &msg)
 {
   Serial.print(msg);
   if (telnetClient && telnetClient.connected())
   {
     telnetClient.print(msg);
   }
+  bot.sendMessage(CHAT_ID, msg);
 }
 
-void debugPrintln(const String &msg)
+void logPrintln(const String &msg)
 {
   Serial.println(msg);
   if (telnetClient && telnetClient.connected())
   {
     telnetClient.println(msg);
   }
+  bot.sendMessage(CHAT_ID, msg);
 }
 
+void debugPrint(const String &msg)
+{
+  if (!debug)
+    return;
+  Serial.print(msg);
+  if (telnetClient && telnetClient.connected())
+  {
+    telnetClient.print(msg);
+  }
+  bot.sendMessage(CHAT_ID, msg);
+}
+
+void debugPrintln(const String &msg)
+{
+  if (!debug)
+    return;
+  Serial.println(msg);
+  if (telnetClient && telnetClient.connected())
+  {
+    telnetClient.println(msg);
+  }
+  bot.sendMessage(CHAT_ID, msg);
+}
+
+// DEBUG
 void setup()
 {
   Serial.begin(115200);
@@ -105,30 +133,27 @@ void setup()
   debugPrintln("ArduinoOTA pronto");
 }
 
-void handleSensore(int umidita[2])
+void leggiSensori(int umidita[2])
 {
   umidita[0] = analogRead(Pin_Sensore1);
   umidita[1] = analogRead(Pin_Sensore2);
-
-  if (debug)
-  {
-    bot.sendMessage(CHAT_ID, "umidità: " + String(umidita[0]) + ", " + String(umidita[1]));
-
-    
-  }
+}
+void handleSensore()
+{
+  int umidita[2];
+  leggiSensori(umidita);
   debugPrintln("umidità: " + String(umidita[0]) + ", " + String(umidita[1]));
 }
 
-void handleDebug(){
+void handleDebug()
+{
   debug = !debug;
-  if(debug){
-    bot.sendMessage(CHAT_ID, "Ho attivato la modalita DEBUG!");
-
+  if (debug)
+  {
     debugPrintln("Ho attivato la modalita DEBUG!");
   }
-  else{
-    bot.sendMessage(CHAT_ID, "Ho disattivato la modalita DEBUG!");
-
+  else
+  {
     debugPrintln("Ho disattivato la modalita DEBUG!");
   }
 }
@@ -154,8 +179,7 @@ void handleMessage(String text)
   }
   else if (text == "/sensore")
   {
-    int umidita[2];
-    handleSensore(umidita);
+    handleSensore();
   }
   else if (text == "/debug")
   {
