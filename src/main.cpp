@@ -41,6 +41,8 @@ WiFiClient telnetClient;
 
 int botRequestDelay = 3000;       // Tempo minimo tra due controlli per nuovi messaggi da Telegram
 unsigned long lastTimeBotRan = 0; // Memorizza l’ultima volta in cui il bot ha controllato nuovi messaggi
+unsigned long offTimeMot1 = 0;
+unsigned long offTimeMot2 = 0;
 
 // inizializzo varibili per debug e manutenzione
 bool manutenzione = false;
@@ -104,6 +106,10 @@ void setup()
   pinMode(Pin_Relay1, OUTPUT);
   pinMode(Pin_Relay2, OUTPUT);
 
+  //Spengo i motori all'accensione
+  digitalWrite(Pin_Relay1, HIGH);
+  digitalWrite(Pin_Relay2, HIGH);
+
   // Avvio wifi
   debugPrint("Connessione a ");
   debugPrintln(ssid);
@@ -145,6 +151,40 @@ void leggiSensori(int umidita[2])
 {
   umidita[0] = analogRead(Pin_Sensore1);
   umidita[1] = analogRead(Pin_Sensore2);
+}
+
+void accendiMotori(int who, int tempo){
+  if(who == 1){
+    offTimeMot1 = tempo * 1000UL + millis();
+    digitalWrite(Pin_Relay1, LOW);
+  }
+  if(who == 2){
+    offTimeMot2 = tempo * 1000UL + millis();
+    digitalWrite(Pin_Relay2, LOW);
+  }
+  if(who == 3){
+    offTimeMot1 = tempo * 1000UL + millis();
+    digitalWrite(Pin_Relay1, LOW);
+    offTimeMot2 = tempo * 1000UL + millis();
+    digitalWrite(Pin_Relay2, LOW);
+  }
+}
+
+void spegniMotori(int who){
+  if(who == 1){
+    offTimeMot1 = 0;
+    digitalWrite(Pin_Relay1, HIGH);
+  }
+  if(who == 2){
+    offTimeMot2 = 0;
+    digitalWrite(Pin_Relay2, HIGH);
+  }
+  if(who == 3){
+    offTimeMot1 = 0;
+    digitalWrite(Pin_Relay1, HIGH);
+    offTimeMot2 = 0;
+    digitalWrite(Pin_Relay2, HIGH);
+  }
 }
 
 void handleSensore()
@@ -189,27 +229,32 @@ void askTime(const String &who) {
 void handleCallBack(String text){
   if (text == "mot1_on")
   {
+    if (botstate != IDLE) return; // se sto aspettando un tempo ignora i messaggi del motore
     botstate = ASK_TIME_MOT1;
     askTime("motore 1");
   }
   else if (text == "mot2_on")
   {
+    if (botstate != IDLE) return;
     botstate = ASK_TIME_MOT2;
     askTime("motore 2");
   }
   else if (text == "mot_all_on")
   {
+    if (botstate != IDLE) return;
     botstate = ASK_TIME_BOTH;
     askTime("entrambi i motori?");
   }
 
   else if (text.startsWith("t_"))
   {
+    if (botstate == IDLE) return; //se non ho scelto un motore ignora i tempi
     int seconds = 0;
     if(text == "t_10") seconds = 10;
     else if(text == "t_30") seconds = 30;
     else if(text == "t_60") seconds = 60;
     bot.sendMessage(CHAT_ID,"Avvio il motore " + String(botstate) + " per " + String(seconds) + " secondi");
+    accendiMotori(int(botstate), seconds);
     botstate = IDLE;
   }
 }
@@ -311,5 +356,14 @@ void loop()
     }
     telnetClient = telnetServer.available();
     debugPrintln("Client Telnet connesso");
+  }
+
+  //controllo spegnimento motori
+  if(offTimeMot1 != 0 && (long)(now - offTimeMot1) >= 0){
+    spegniMotori(1);
+  }
+
+  if(offTimeMot2 != 0 && (long)(now - offTimeMot2) >= 0){
+    spegniMotori(2);
   }
 }
