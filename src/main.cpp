@@ -4,11 +4,14 @@
 #include <ArduinoOTA.h>
 #include <UniversalTelegramBot.h>
 #include <time.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 
 #include "secrets.h"
 
 // Pin utilizzati
-enum BotState {
+enum BotState
+{
   IDLE,
   ASK_TIME_MOT1,
   ASK_TIME_MOT2,
@@ -26,6 +29,11 @@ BotState botstate = IDLE;
 // Dati WiFi
 const char *ssid = SECRET_WIFI_SSID;
 const char *password = SECRET_WIFI_PASS;
+
+// Configurazione Meteo
+String openWeatherMapApiKey = SECRET_API_OPENWEATHER;
+String city = "Vernasca";           // O la tua città
+String countryCode = "IT";      // Codice paese
 
 // Token del bot Telegram e chat ID
 #define BOTtoken SECRET_BOT_TOKEN
@@ -106,7 +114,7 @@ void setup()
   pinMode(Pin_Relay1, OUTPUT);
   pinMode(Pin_Relay2, OUTPUT);
 
-  //Spengo i motori all'accensione
+  // Spengo i motori all'accensione
   digitalWrite(Pin_Relay1, HIGH);
   digitalWrite(Pin_Relay2, HIGH);
 
@@ -147,22 +155,49 @@ void setup()
   debugPrintln("ArduinoOTA pronto");
 }
 
+
+
+bool deleteMessage(String chatId, String messageId)
+{
+  if (WiFi.status() != WL_CONNECTED)
+    return false;
+
+  String url = "https://api.telegram.org/bot" + String(BOTtoken) +
+               "/deleteMessage?chat_id=" + chatId +
+               "&message_id=" + messageId;
+
+  HTTPClient http;
+  http.begin(client, url); // Usa lo stesso client sicuro del bot
+  int httpCode = http.GET();
+  http.end();
+
+  if (httpCode == 200)
+  {
+    return true;
+  }
+  return false;
+}
+
 void leggiSensori(int umidita[2])
 {
   umidita[0] = analogRead(Pin_Sensore1);
   umidita[1] = analogRead(Pin_Sensore2);
 }
 
-void accendiMotori(int who, int tempo){
-  if(who == 1){
+void accendiMotori(int who, int tempo)
+{
+  if (who == 1)
+  {
     offTimeMot1 = tempo * 1000UL + millis();
     digitalWrite(Pin_Relay1, LOW);
   }
-  if(who == 2){
+  if (who == 2)
+  {
     offTimeMot2 = tempo * 1000UL + millis();
     digitalWrite(Pin_Relay2, LOW);
   }
-  if(who == 3){
+  if (who == 3)
+  {
     offTimeMot1 = tempo * 1000UL + millis();
     digitalWrite(Pin_Relay1, LOW);
     offTimeMot2 = tempo * 1000UL + millis();
@@ -170,16 +205,20 @@ void accendiMotori(int who, int tempo){
   }
 }
 
-void spegniMotori(int who){
-  if(who == 1){
+void spegniMotori(int who)
+{
+  if (who == 1)
+  {
     offTimeMot1 = 0;
     digitalWrite(Pin_Relay1, HIGH);
   }
-  if(who == 2){
+  if (who == 2)
+  {
     offTimeMot2 = 0;
     digitalWrite(Pin_Relay2, HIGH);
   }
-  if(who == 3){
+  if (who == 3)
+  {
     offTimeMot1 = 0;
     digitalWrite(Pin_Relay1, HIGH);
     offTimeMot2 = 0;
@@ -207,61 +246,71 @@ void handleDebug()
   }
 }
 
-void askTime(const String &who) {
+void askTime(const String &who)
+{
   String keyboardJson = F(
-    "[["
+      "[["
       "{\"text\":\"10s\",\"callback_data\":\"t_10\"},"
       "{\"text\":\"30s\",\"callback_data\":\"t_30\"}"
-    "],"
-    "["
+      "],"
+      "["
       "{\"text\":\"60s\",\"callback_data\":\"t_60\"}"
-    "]]"
-  );
+      "]]");
 
   bot.sendMessageWithInlineKeyboard(
-    CHAT_ID,
-    "Quanto tempo per " + who + "?",
-    "",
-    keyboardJson
-  );
+      CHAT_ID,
+      "Quanto tempo per " + who + "?",
+      "",
+      keyboardJson);
 }
 
-void handleCallBack(String text){
+void handleCallBack(String text, String chatId, String messageId)
+{
+  deleteMessage(chatId, messageId);
+
   if (text == "mot1_on")
   {
-    if (botstate != IDLE) return; // se sto aspettando un tempo ignora i messaggi del motore
+    if (botstate != IDLE)
+      return; // se sto aspettando un tempo ignora i messaggi del motore
     botstate = ASK_TIME_MOT1;
     askTime("motore 1");
   }
   else if (text == "mot2_on")
   {
-    if (botstate != IDLE) return;
+    if (botstate != IDLE)
+      return;
     botstate = ASK_TIME_MOT2;
     askTime("motore 2");
   }
   else if (text == "mot_all_on")
   {
-    if (botstate != IDLE) return;
+    if (botstate != IDLE)
+      return;
     botstate = ASK_TIME_BOTH;
     askTime("entrambi i motori?");
   }
 
   else if (text.startsWith("t_"))
   {
-    if (botstate == IDLE) return; //se non ho scelto un motore ignora i tempi
+    if (botstate == IDLE)
+      return; // se non ho scelto un motore ignora i tempi
     int seconds = 0;
-    if(text == "t_10") seconds = 10;
-    else if(text == "t_30") seconds = 30;
-    else if(text == "t_60") seconds = 60;
-    bot.sendMessage(CHAT_ID,"Avvio il motore " + String(botstate) + " per " + String(seconds) + " secondi");
+    if (text == "t_10")
+      seconds = 10;
+    else if (text == "t_30")
+      seconds = 30;
+    else if (text == "t_60")
+      seconds = 60;
+    bot.sendMessage(CHAT_ID, "Avvio il motore " + String(botstate) + " per " + String(seconds) + " secondi");
     accendiMotori(int(botstate), seconds);
     botstate = IDLE;
   }
 }
 
-void handleMessage(String text)
+void handleMessage(String text, String chatId, String messageId)
 {
   text.trim(); // togli spazi / \n
+  deleteMessage(chatId, messageId);
   if (text == "/acceso")
   {
     /* handleAcceso(); */
@@ -328,42 +377,48 @@ void loop()
     {
       for (int i = 0; i < numNewMessages; i++)
       {
-        String type = bot.messages[i].type;   // <-- chiave
+        String type = bot.messages[i].type;
+        String text = bot.messages[i].text;
+        String chatId = bot.messages[i].chat_id;
+        int msgIdiNT = bot.messages[i].message_id;
+        String messageId = String(msgIdiNT); // ID per cancellare
 
-        if (type == "message") {
-          String text = bot.messages[i].text;
+        if (type == "message")
+        {
           debugPrint("Messaggio: ");
           debugPrintln(text);
-          handleMessage(text);               // /debug, /sensore, /test...
+          handleMessage(text, chatId, messageId);
         }
-        else if (type == "callback_query") {
-          String data = bot.messages[i].text;
+        else if (type == "callback_query")
+        {
           debugPrint("Callback: ");
-          debugPrintln(data);
-          handleCallBack(data);              // mot1_on, mot2_on, mot_all_on
+          debugPrintln(text);
+          handleCallBack(text, chatId, messageId);
         }
       }
+      lastTimeBotRan = now;
     }
-    lastTimeBotRan = now;
-  }
 
-  // Gestione nuove connessioni Telnet
-  if (telnetServer.hasClient())
-  {
-    if (telnetClient && telnetClient.connected())
+    // Gestione nuove connessioni Telnet
+    if (telnetServer.hasClient())
     {
-      telnetClient.stop();
+      if (telnetClient && telnetClient.connected())
+      {
+        telnetClient.stop();
+      }
+      telnetClient = telnetServer.available();
+      debugPrintln("Client Telnet connesso");
     }
-    telnetClient = telnetServer.available();
-    debugPrintln("Client Telnet connesso");
-  }
 
-  //controllo spegnimento motori
-  if(offTimeMot1 != 0 && (long)(now - offTimeMot1) >= 0){
-    spegniMotori(1);
-  }
+    // controllo spegnimento motori
+    if (offTimeMot1 != 0 && (long)(now - offTimeMot1) >= 0)
+    {
+      spegniMotori(1);
+    }
 
-  if(offTimeMot2 != 0 && (long)(now - offTimeMot2) >= 0){
-    spegniMotori(2);
+    if (offTimeMot2 != 0 && (long)(now - offTimeMot2) >= 0)
+    {
+      spegniMotori(2);
+    }
   }
 }
