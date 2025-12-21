@@ -6,6 +6,7 @@
 #include <time.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <string.h>
 
 #include "secrets.h"
 
@@ -32,8 +33,8 @@ const char *password = SECRET_WIFI_PASS;
 
 // Configurazione Meteo
 String openWeatherMapApiKey = SECRET_API_OPENWEATHER;
-String city = "Vernasca";           // O la tua città
-String countryCode = "IT";      // Codice paese
+String city = "Vernasca";  // O la tua città
+String countryCode = "IT"; // Codice paese
 
 // Token del bot Telegram e chat ID
 #define BOTtoken SECRET_BOT_TOKEN
@@ -57,12 +58,28 @@ bool manutenzione = false;
 bool debug = false;
 
 // ---- FUNZIONI DI DEBUG (Serial + Telnet) ----
+String getTime(){
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)) return "No time!";
+
+  const char* giorni[] = {"DOM", "LUN", "MAR", "MER", "GIO", "VEN", "SAB"};
+
+  char buff[30];
+
+  sprintf(buff, "%s %02d/%02d %02d:%02d:%02d", 
+          giorni[timeinfo.tm_wday], 
+          timeinfo.tm_mday, timeinfo.tm_mon+1,
+          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+
+  return String(buff);
+}
+
 void logPrint(const String &msg)
 {
   Serial.print(msg);
   if (telnetClient && telnetClient.connected())
   {
-    telnetClient.print(msg);
+    telnetClient.print(getTime() + "   |   " + msg);
   }
   bot.sendMessage(CHAT_ID, msg);
 }
@@ -74,7 +91,7 @@ void logPrintln(const String &msg)
   {
     telnetClient.println(msg);
   }
-  bot.sendMessage(CHAT_ID, msg);
+  bot.sendMessage(CHAT_ID, getTime() + "   |   " + msg);
 }
 
 void debugPrint(const String &msg)
@@ -150,12 +167,10 @@ void setup()
 
   // dopo che il WiFi è connesso
   debugPrintln("Imposto orario NTP...");
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov"); // UTC [web:106]
+  configTime(3600, 3600, "pool.ntp.org", "time.nist.gov"); 
 
   debugPrintln("ArduinoOTA pronto");
 }
-
-
 
 bool deleteMessage(String chatId, String messageId)
 {
@@ -229,8 +244,15 @@ void spegniMotori(int who)
 void handleSensore()
 {
   int umidita[2];
+
+  int dryValue = 3300;
+  int wetValue = 1050;
+
   leggiSensori(umidita);
-  debugPrintln("umidità: " + String(umidita[0]) + ", " + String(umidita[1]));
+
+  int umiditaSens1 = map(umidita[0], dryValue, wetValue, 0, 100);
+  int umiditaSens2 = map(umidita[1], dryValue, wetValue, 0, 100);
+  logPrintln("umidità: " + String(umiditaSens1) + "% (" + String(umidita[0]) + "), " + String(umiditaSens2) + "% (" + String(umidita[1]) + ")");
 }
 
 void handleDebug()
