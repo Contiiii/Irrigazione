@@ -6,7 +6,7 @@
 #include <time.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <string.h>
+#include <SPIFFS.h>
 
 #include "secrets.h"
 
@@ -18,6 +18,13 @@ enum BotState
   ASK_TIME_MOT2,
   ASK_TIME_BOTH
 };
+enum LogLevel
+{
+  INFO,
+  DEBUG_L,
+  WARN,
+  ERROR_L
+};
 
 #define Pin_SensoreContenitore 34
 #define Pin_Sensore1 33
@@ -26,6 +33,8 @@ enum BotState
 #define Pin_Relay2 19
 
 BotState botstate = IDLE;
+bool timeReady = false;
+bool spiffsOK = false;
 
 // Dati WiFi
 const char *ssid = SECRET_WIFI_SSID;
@@ -50,78 +59,111 @@ WiFiClient telnetClient;
 
 int botRequestDelay = 3000;       // Tempo minimo tra due controlli per nuovi messaggi da Telegram
 unsigned long lastTimeBotRan = 0; // Memorizza l’ultima volta in cui il bot ha controllato nuovi messaggi
+unsigned long lastTelegramMs = 0;
+const unsigned long TELEGRAM_MIN_INTERVAL_MS = 1200; // ~1 msg/sec prudente
 unsigned long offTimeMot1 = 0;
 unsigned long offTimeMot2 = 0;
+String telnetLine; // buffer comando telnet
 
 // inizializzo varibili per debug e manutenzione
 bool manutenzione = false;
 bool debug = false;
 
+// Prototipi
+void handleTelnet();
+void handleTelnetCommand(const String &cmd);
+void telnetSendFileAll(const char *path);
+void telnetSendTail(const char *path, int maxLines);
+
 // ---- FUNZIONI DI DEBUG (Serial + Telnet) ----
-String getTime(){
+String getTime()
+{
+  if (!timeReady)
+    return "BOOT";
   struct tm timeinfo;
-  if(!getLocalTime(&timeinfo)) return "No time!";
+  if (!getLocalTime(&timeinfo))
+    return "No time!";
 
-  const char* giorni[] = {"DOM", "LUN", "MAR", "MER", "GIO", "VEN", "SAB"};
+  const char *giorni[] = {"DOM", "LUN", "MAR", "MER", "GIO", "VEN", "SAB"};
 
-  char buff[30];
+  char buff[32];
 
-  sprintf(buff, "%s %02d/%02d %02d:%02d:%02d", 
-          giorni[timeinfo.tm_wday], 
-          timeinfo.tm_mday, timeinfo.tm_mon+1,
+  sprintf(buff, "%s %02d/%02d %02d:%02d:%02d",
+          giorni[timeinfo.tm_wday],
+          timeinfo.tm_mday, timeinfo.tm_mon + 1,
           timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
 
   return String(buff);
 }
 
-void logPrint(const String &msg)
+void appendLogFile(const String &line)
 {
-  Serial.print(msg);
+  if (!spiffsOK)
+    return;
+
+  File f = SPIFFS.open("/log.txt", FILE_APPEND);
+
+  if (!f)
+    return;
+
+  f.print(line);
+  f.close();
+}
+
+void logLine(LogLevel lvl, const String &msg, bool newline = true, bool toTelegram = false)
+{
+  const char *L[] = {"I", "D", "W", "E"};
+  String line = getTime() + " | " + L[lvl] + " | " + msg;
+
+  // Log file
+  appendLogFile(line + "\r\n");
+
+  // Serial
+  Serial.print(line);
+
+  // Telnet
   if (telnetClient && telnetClient.connected())
   {
-    telnetClient.print(getTime() + "   |   " + msg);
+    telnetClient.print(line);
+    if (newline)
+      telnetClient.print("\r\n"); // <-- QUESTO sistema la “scaletta” [web:187]
   }
-  bot.sendMessage(CHAT_ID, msg);
+
+  // Telegram
+
+  if (toTelegram)
+  {
+    if (millis() - lastTelegramMs >= TELEGRAM_MIN_INTERVAL_MS)
+    {
+      bot.sendMessage(CHAT_ID, line); // line già include timestamp+livello
+      lastTelegramMs = millis();
+    }
+  }
 }
 
 void logPrintln(const String &msg)
 {
-  Serial.println(msg);
-  if (telnetClient && telnetClient.connected())
-  {
-    telnetClient.println(msg);
-  }
-  bot.sendMessage(CHAT_ID, getTime() + "   |   " + msg);
-}
-
-void debugPrint(const String &msg)
-{
-  if (!debug)
-    return;
-  Serial.print(msg);
-  if (telnetClient && telnetClient.connected())
-  {
-    telnetClient.print(msg);
-  }
-  bot.sendMessage(CHAT_ID, msg);
+  logLine(INFO, msg, true, true);
 }
 
 void debugPrintln(const String &msg)
 {
   if (!debug)
     return;
-  Serial.println(msg);
-  if (telnetClient && telnetClient.connected())
-  {
-    telnetClient.println(msg);
-  }
-  bot.sendMessage(CHAT_ID, msg);
+  logLine(DEBUG_L, msg, true, false);
+}
+
+void debugPrint(const String &msg)
+{
+  if (!debug)
+    return;
+  logLine(DEBUG_L, msg, false, false);
 }
 
 void setup()
 {
   Serial.begin(115200);
-  delay(100);
+  delay(200);
 
   debugPrintln("Boot ESP32...");
 
@@ -151,10 +193,18 @@ void setup()
   debugPrint("Connesso! IP: ");
   debugPrintln(WiFi.localIP().toString());
 
+  // dopo che il WiFi è connesso
+  debugPrintln("Imposto orario NTP...");
+  configTime(3600, 3600, "pool.ntp.org", "time.nist.gov");
+
+  struct tm t;
+  timeReady = getLocalTime(&t, 10000);
+
   // Certificato root per Telegram HTTPS
   client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
 
   // Messaggio di avvio
+  bot.waitForResponse = 9000;
   bot.sendMessage(CHAT_ID, "BOT ATTIVO!", "");
 
   // Avvio modalita OTA
@@ -165,9 +215,9 @@ void setup()
   telnetServer.begin(); // Avvia server Telnet
   telnetServer.setNoDelay(true);
 
-  // dopo che il WiFi è connesso
-  debugPrintln("Imposto orario NTP...");
-  configTime(3600, 3600, "pool.ntp.org", "time.nist.gov"); 
+  // Log su file
+  spiffsOK = SPIFFS.begin(true); // true = formatta se non montabile [web:61]
+  logLine(INFO, String("SPIFFS: ") + (spiffsOK ? "OK" : "FAIL"), true, false);
 
   debugPrintln("ArduinoOTA pronto");
 }
@@ -191,6 +241,116 @@ bool deleteMessage(String chatId, String messageId)
     return true;
   }
   return false;
+}
+
+String tailLog(int maxLines)
+{
+  File f = SPIFFS.open("/log.txt", FILE_READ);
+  if (!f)
+    return "Nessun log.";
+
+  String lines[80];
+  maxLines = min(maxLines, 80);
+  int idx = 0;
+
+  while (f.available())
+  {
+    lines[idx % maxLines] = f.readStringUntil('\n');
+    idx++;
+  }
+  f.close();
+
+  int start = max(0, idx - maxLines);
+  String out;
+  for (int i = start; i < idx; i++)
+    out += lines[i % maxLines] + "\n";
+  return out;
+}
+
+void handleTelnet()
+{
+  // Accetta nuovo client
+  if (telnetServer.hasClient())
+  {
+    if (telnetClient && telnetClient.connected())
+      telnetClient.stop();
+    telnetClient = telnetServer.available();
+    telnetClient.println("Telnet OK. Comandi: tail, clear, size");
+  }
+  if (telnetClient && telnetClient.connected() && telnetClient.available())
+  {
+    char c = telnetClient.read();
+    if (c == '\r')
+      return;
+    if (c == '\n')
+    {
+      telnetLine.trim();
+      handleTelnetCommand(telnetLine);
+      telnetLine = "";
+    }
+    else
+    {
+      telnetLine += c;
+    }
+  }
+}
+
+void handleTelnetCommand(const String &cmd)
+{
+  if (cmd.startsWith("tail"))
+  {
+    int n = 50;
+    int sp = cmd.indexOf(' ');
+    if (sp > 0)
+      n = cmd.substring(sp + 1).toInt();
+    if (n <= 0)
+      n = 50;
+    telnetSendTail("/log.txt", n);
+  }
+  else if (cmd == "clear")
+  {
+    SPIFFS.remove("/log.txt");
+    telnetClient.println("OK cleared.");
+  }
+  else if (cmd == "size")
+  {
+    File f = SPIFFS.open("/log.txt", FILE_READ);
+    telnetClient.printf("log.txt = %u bytes\r\n", f ? (unsigned)f.size() : 0);
+    if (f)
+      f.close();
+  }
+  else
+  {
+    telnetClient.println("Comandi: tail [N], clear, size");
+  }
+}
+
+
+void telnetSendTail(const char *path, int maxLines)
+{
+  File f = SPIFFS.open(path, FILE_READ);
+  if (!f)
+  {
+    telnetClient.println("No file.");
+    return;
+  }
+
+  // semplice: conserva ultime maxLines righe in ring buffer
+  String lines[200]; // alza/abbassa
+  maxLines = min(maxLines, 200);
+  int idx = 0;
+
+  while (f.available())
+  {
+    lines[idx % maxLines] = f.readStringUntil('\n');
+    idx++;
+  }
+  f.close();
+
+  int start = max(0, idx - maxLines);
+  for (int i = start; i < idx; i++)
+    telnetClient.println(lines[i % maxLines]);
+  telnetClient.println("-- EOF (tail) --");
 }
 
 void leggiSensori(int umidita[2])
@@ -323,7 +483,7 @@ void handleCallBack(String text, String chatId, String messageId)
       seconds = 30;
     else if (text == "t_60")
       seconds = 60;
-    bot.sendMessage(CHAT_ID, "Avvio il motore " + String(botstate) + " per " + String(seconds) + " secondi");
+    logPrintln("Avvio il motore " + String(botstate) + " per " + String(seconds) + " secondi");
     accendiMotori(int(botstate), seconds);
     botstate = IDLE;
   }
@@ -333,19 +493,7 @@ void handleMessage(String text, String chatId, String messageId)
 {
   text.trim(); // togli spazi / \n
   deleteMessage(chatId, messageId);
-  if (text == "/acceso")
-  {
-    /* handleAcceso(); */
-  }
-  else if (text == "/spento")
-  {
-    /* handleSpento(); */
-  }
-  else if (text == "/stato")
-  {
-    /* handleStato(); */
-  }
-  else if (text == "/meteo")
+  if (text == "/meteo")
   {
     /* handleMeteo(); */
   }
@@ -378,22 +526,47 @@ void handleMessage(String text, String chatId, String messageId)
         "", // parseMode
         keyboardJson);
   }
+  else if (text == "/log")
+  {
+    bot.sendMessage(CHAT_ID, tailLog(40), "");
+  }
+  else if (text == "/clearlog")
+  {
+    SPIFFS.remove("/log.txt");
+    bot.sendMessage(CHAT_ID, "Log cancellato.", "");
+  }
   else
   {
     debugPrintln("Comando sconosciuto: " + text);
-    bot.sendMessage(CHAT_ID, "Comando non riconosciuto", "");
   }
 }
 
 void loop()
 {
   ArduinoOTA.handle();
+  unsigned long now = millis();
+
+  // Gestione nuove connessioni Telnet
+  handleTelnet();
+
+  // controllo spegnimento motori
+  if (offTimeMot1 != 0 && (long)(now - offTimeMot1) >= 0)
+  {
+    spegniMotori(1);
+  }
+
+  if (offTimeMot2 != 0 && (long)(now - offTimeMot2) >= 0)
+  {
+    spegniMotori(2);
+  }
 
   // Gestione bot Telegram ogni botRequestDelay ms
-  unsigned long now = millis();
+
   if (now - lastTimeBotRan > (unsigned long)botRequestDelay)
   {
     int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+
+    lastTimeBotRan = now;
 
     if (numNewMessages > 0)
     {
@@ -418,29 +591,6 @@ void loop()
           handleCallBack(text, chatId, messageId);
         }
       }
-      lastTimeBotRan = now;
-    }
-
-    // Gestione nuove connessioni Telnet
-    if (telnetServer.hasClient())
-    {
-      if (telnetClient && telnetClient.connected())
-      {
-        telnetClient.stop();
-      }
-      telnetClient = telnetServer.available();
-      debugPrintln("Client Telnet connesso");
-    }
-
-    // controllo spegnimento motori
-    if (offTimeMot1 != 0 && (long)(now - offTimeMot1) >= 0)
-    {
-      spegniMotori(1);
-    }
-
-    if (offTimeMot2 != 0 && (long)(now - offTimeMot2) >= 0)
-    {
-      spegniMotori(2);
     }
   }
 }
