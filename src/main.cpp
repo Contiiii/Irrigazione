@@ -19,7 +19,7 @@
 #define Pin_Relay1 18
 #define Pin_Relay2 19
 
-//Variabili utilizzate
+// Variabili utilizzate
 enum BotState
 {
   IDLE,
@@ -38,6 +38,7 @@ enum LogLevel
 BotState botstate = IDLE;
 bool timeReady = false;
 bool spiffsOK = false;
+const size_t MAX_LOG_SIZE = 400 * 1024;
 
 // Dati WiFi
 const char *ssid = SECRET_WIFI_SSID;
@@ -61,13 +62,13 @@ WiFiServer telnetServer(23); // Porta Telnet
 WiFiClient telnetClient;
 String telnetLine; // buffer comando telnet
 
-//Variabili per bot telegram
+// Variabili per bot telegram
 int botRequestDelay = 3000;       // Tempo minimo tra due controlli per nuovi messaggi da Telegram
 unsigned long lastTimeBotRan = 0; // Memorizza l’ultima volta in cui il bot ha controllato nuovi messaggi
 unsigned long lastTelegramMs = 0;
 const unsigned long TELEGRAM_MIN_INTERVAL_MS = 1200; // ~1 msg/sec prudente
 
-//Variabili motori
+// Variabili motori
 unsigned long offTimeMot1 = 0;
 unsigned long offTimeMot2 = 0;
 
@@ -152,6 +153,7 @@ void setup()
   // Avvio modalita TELNET
   telnetServer.begin(); // Avvia server Telnet
   telnetServer.setNoDelay(true);
+  telnetLine.reserve(128);
 
   // Log su file
   spiffsOK = SPIFFS.begin(true); // true = formatta se non montabile [web:61]
@@ -238,11 +240,21 @@ void appendLogFile(const String &line)
   if (!spiffsOK)
     return;
 
-  File f = SPIFFS.open("/log.txt", FILE_APPEND);
+  File r = SPIFFS.open("/log.txt", FILE_READ);
+  size_t sz = r ? (size_t)r.size() : 0;
+  if (r)
+    r.close();
 
+  if (sz > MAX_LOG_SIZE)
+  {
+    SPIFFS.remove("/log.old"); // ok anche se non esiste
+    bool ok = SPIFFS.rename("/log.txt", "/log.old");
+    // opzionale: Serial.printf("rotate=%d\r\n", ok);
+  }
+
+  File f = SPIFFS.open("/log.txt", FILE_APPEND);
   if (!f)
     return;
-
   f.print(line);
   f.close();
 }
@@ -253,7 +265,14 @@ void logLine(LogLevel lvl, const String &msg, bool newline = true, bool toTelegr
     return;
 
   const char *L[] = {"I", "D", "W", "E"};
-  String line = getTime() + " | " + L[lvl] + " | " + msg;
+
+  String line;
+  line.reserve(200); // scegli una stima realistica
+  line = getTime();
+  line += " | ";
+  line += L[lvl];
+  line += " | ";
+  line += msg;
 
   // Log file
   appendLogFile(line + "\r\n");
@@ -286,9 +305,11 @@ bool deleteMessage(String chatId, String messageId)
   if (WiFi.status() != WL_CONNECTED)
     return false;
 
-  String url = "https://api.telegram.org/bot" + String(BOTtoken) +
-               "/deleteMessage?chat_id=" + chatId +
-               "&message_id=" + messageId;
+  String url;
+  url.reserve(220);
+  url = "https://api.telegram.org/bot" + String(BOTtoken) +
+        "/deleteMessage?chat_id=" + chatId +
+        "&message_id=" + messageId;
 
   HTTPClient http;
   http.begin(client, url); // Usa lo stesso client sicuro del bot
@@ -321,6 +342,7 @@ String tailLog(int maxLines)
 
   int start = max(0, idx - maxLines);
   String out;
+  out.reserve(2500);
   for (int i = start; i < idx; i++)
     out += lines[i % maxLines] + "\n";
   return out;
@@ -366,10 +388,11 @@ void handleTelnetCommand(const String &cmd)
 {
   if (cmd.startsWith("tail"))
   {
-    int n = 50;
-    int sp = cmd.indexOf(' ');
-    if (sp > 0)
-      n = cmd.substring(sp + 1).toInt();
+    String arg = cmd.substring(4); // dopo "tail"
+    arg.trim();
+    arg.replace("[", "");
+    arg.replace("]", "");
+    int n = arg.toInt();
     if (n <= 0)
       n = 50;
     telnetSendTail("/log.txt", n);
@@ -455,7 +478,18 @@ void handleSensore()
 
   int umiditaSens1 = map(umidita[0], dryValue, wetValue, 0, 100);
   int umiditaSens2 = map(umidita[1], dryValue, wetValue, 0, 100);
-  logLine(DEBUG_L, "umidità: " + String(umiditaSens1) + "% (" + String(umidita[0]) + "), " + String(umiditaSens2) + "% (" + String(umidita[1]) + ")", true, true);
+  String msg;
+  msg.reserve(160);
+  msg = "umidità: ";
+  msg += umiditaSens1;
+  msg += "% (";
+  msg += umidita[0];
+  msg += "), ";
+  msg += umiditaSens2;
+  msg += "% (";
+  msg += umidita[1];
+  msg += ")";
+  logLine(INFO, msg, true, true);
 }
 
 // motori
@@ -557,7 +591,7 @@ void handleCallBack(String text, String chatId, String messageId)
       seconds = 30;
     else if (text == "t_60")
       seconds = 60;
-    logLine(DEBUG_L, "Avvio il motore " + String(botstate) + " per " + String(seconds) + " secondi", true, true);
+    logLine(INFO, "Avvio il motore " + String(botstate) + " per " + String(seconds) + " secondi", true, true);
 
     accendiMotori(int(botstate), seconds);
     botstate = IDLE;
@@ -612,6 +646,6 @@ void handleMessage(String text, String chatId, String messageId)
   }
   else
   {
-    logLine(DEBUG_L, String("Comando sconosciuto: ") + text, true, true);
+    logLine(INFO, String("Comando sconosciuto: ") + text, true, true);
   }
 }
