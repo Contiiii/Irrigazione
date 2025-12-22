@@ -1,3 +1,5 @@
+// Inserire check livello acqua, adattare percentuale acqua al 100, meteo
+// dimensiono file, ciclo di controllo, lettura corretta sensori
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -11,6 +13,13 @@
 #include "secrets.h"
 
 // Pin utilizzati
+#define Pin_SensoreContenitore 34
+#define Pin_Sensore1 33
+#define Pin_Sensore2 32
+#define Pin_Relay1 18
+#define Pin_Relay2 19
+
+//Variabili utilizzate
 enum BotState
 {
   IDLE,
@@ -25,12 +34,6 @@ enum LogLevel
   WARN,
   ERROR_L
 };
-
-#define Pin_SensoreContenitore 34
-#define Pin_Sensore1 33
-#define Pin_Sensore2 32
-#define Pin_Relay1 18
-#define Pin_Relay2 19
 
 BotState botstate = IDLE;
 bool timeReady = false;
@@ -56,26 +59,160 @@ UniversalTelegramBot bot(BOTtoken, client);
 // Avvio di Telnet
 WiFiServer telnetServer(23); // Porta Telnet
 WiFiClient telnetClient;
+String telnetLine; // buffer comando telnet
 
+//Variabili per bot telegram
 int botRequestDelay = 3000;       // Tempo minimo tra due controlli per nuovi messaggi da Telegram
 unsigned long lastTimeBotRan = 0; // Memorizza l’ultima volta in cui il bot ha controllato nuovi messaggi
 unsigned long lastTelegramMs = 0;
 const unsigned long TELEGRAM_MIN_INTERVAL_MS = 1200; // ~1 msg/sec prudente
+
+//Variabili motori
 unsigned long offTimeMot1 = 0;
 unsigned long offTimeMot2 = 0;
-String telnetLine; // buffer comando telnet
 
 // inizializzo varibili per debug e manutenzione
 bool manutenzione = false;
 bool debug = false;
 
-// Prototipi
+// Prototipi di log
+String getTime();
+void appendLogFile(const String &line);
+void logLine(LogLevel lvl, const String &msg, bool newline, bool toTelegram);
+bool deleteMessage(String chatId, String messageId);
+String tailLog(int maxLines);
+void handleDebug();
+
+// Prototipi di telnet
 void handleTelnet();
 void handleTelnetCommand(const String &cmd);
-void telnetSendFileAll(const char *path);
 void telnetSendTail(const char *path, int maxLines);
 
+// Prototipi dei sensori
+void leggiSensori(int umidita[2]);
+void handleSensore();
+
+// Prototipi dei motori
+void accendiMotori(int who, int tempo);
+void spegniMotori(int who);
+void askTime(const String &who);
+
+// Prototipi per messaggi telegram
+void handleCallBack(String text, String chatId, String messageId);
+void handleMessage(String text, String chatId, String messageId);
+
 // ---- FUNZIONI DI DEBUG (Serial + Telnet) ----
+void setup()
+{
+  Serial.begin(115200);
+  delay(200);
+
+  // logLine(DEBUG_L, "Boot ESP32...", true, false);
+
+  pinMode(Pin_SensoreContenitore, INPUT_PULLUP);
+  pinMode(Pin_Sensore1, INPUT);
+  pinMode(Pin_Sensore2, INPUT);
+  pinMode(Pin_Relay1, OUTPUT);
+  pinMode(Pin_Relay2, OUTPUT);
+
+  // Spengo i motori all'accensione
+  digitalWrite(Pin_Relay1, HIGH);
+  digitalWrite(Pin_Relay2, HIGH);
+
+  // Avvio wifi
+  logLine(DEBUG_L, String("Connessione a ") + ssid, true, false);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    logLine(DEBUG_L, ".", false, false);
+  }
+  logLine(DEBUG_L, String("Connesso! IP: ") + WiFi.localIP().toString(), true, false);
+
+  // dopo che il WiFi è connesso
+  logLine(DEBUG_L, "Imposto orario NTP...", true, false);
+  configTime(3600, 3600, "pool.ntp.org", "time.nist.gov");
+
+  struct tm t;
+  timeReady = getLocalTime(&t, 10000);
+
+  // Certificato root per Telegram HTTPS
+  client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+
+  // Messaggio di avvio
+  bot.waitForResponse = 9000;
+  bot.sendMessage(CHAT_ID, "BOT ATTIVO!", "");
+
+  // Avvio modalita OTA
+  ArduinoOTA.setHostname("esp32-ota");
+  ArduinoOTA.begin();
+
+  // Avvio modalita TELNET
+  telnetServer.begin(); // Avvia server Telnet
+  telnetServer.setNoDelay(true);
+
+  // Log su file
+  spiffsOK = SPIFFS.begin(true); // true = formatta se non montabile [web:61]
+  logLine(INFO, String("SPIFFS: ") + (spiffsOK ? "OK" : "FAIL"), true, false);
+
+  logLine(DEBUG_L, "ArduinoOTA pronto", true, false);
+}
+
+void loop()
+{
+  ArduinoOTA.handle();
+  unsigned long now = millis();
+
+  // Gestione nuove connessioni Telnet
+  handleTelnet();
+
+  // controllo spegnimento motori
+  if (offTimeMot1 != 0 && (long)(now - offTimeMot1) >= 0)
+  {
+    spegniMotori(1);
+  }
+
+  if (offTimeMot2 != 0 && (long)(now - offTimeMot2) >= 0)
+  {
+    spegniMotori(2);
+  }
+
+  // Gestione bot Telegram ogni botRequestDelay ms
+
+  if (now - lastTimeBotRan > (unsigned long)botRequestDelay)
+  {
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+
+    lastTimeBotRan = now;
+
+    if (numNewMessages > 0)
+    {
+      for (int i = 0; i < numNewMessages; i++)
+      {
+        String type = bot.messages[i].type;
+        String text = bot.messages[i].text;
+        String chatId = bot.messages[i].chat_id;
+        int msgIdiNT = bot.messages[i].message_id;
+        String messageId = String(msgIdiNT); // ID per cancellare
+
+        if (type == "message")
+        {
+          logLine(DEBUG_L, String("messaggio ") + text, true, false);
+          handleMessage(text, chatId, messageId);
+        }
+        else if (type == "callback_query")
+        {
+          logLine(DEBUG_L, String("messaggio ") + text, true, false);
+          handleCallBack(text, chatId, messageId);
+        }
+      }
+    }
+  }
+}
+
+// Funzioni di log
 String getTime()
 {
   if (!timeReady)
@@ -112,6 +249,9 @@ void appendLogFile(const String &line)
 
 void logLine(LogLevel lvl, const String &msg, bool newline = true, bool toTelegram = false)
 {
+  if (!debug && lvl == DEBUG_L)
+    return;
+
   const char *L[] = {"I", "D", "W", "E"};
   String line = getTime() + " | " + L[lvl] + " | " + msg;
 
@@ -139,87 +279,6 @@ void logLine(LogLevel lvl, const String &msg, bool newline = true, bool toTelegr
       lastTelegramMs = millis();
     }
   }
-}
-
-void logPrintln(const String &msg)
-{
-  logLine(INFO, msg, true, true);
-}
-
-void debugPrintln(const String &msg)
-{
-  if (!debug)
-    return;
-  logLine(DEBUG_L, msg, true, false);
-}
-
-void debugPrint(const String &msg)
-{
-  if (!debug)
-    return;
-  logLine(DEBUG_L, msg, false, false);
-}
-
-void setup()
-{
-  Serial.begin(115200);
-  delay(200);
-
-  debugPrintln("Boot ESP32...");
-
-  pinMode(Pin_SensoreContenitore, INPUT_PULLUP);
-  pinMode(Pin_Sensore1, INPUT);
-  pinMode(Pin_Sensore2, INPUT);
-  pinMode(Pin_Relay1, OUTPUT);
-  pinMode(Pin_Relay2, OUTPUT);
-
-  // Spengo i motori all'accensione
-  digitalWrite(Pin_Relay1, HIGH);
-  digitalWrite(Pin_Relay2, HIGH);
-
-  // Avvio wifi
-  debugPrint("Connessione a ");
-  debugPrintln(ssid);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(500);
-    debugPrint(".");
-  }
-  debugPrintln("");
-  debugPrintln("Connesso a WiFi");
-  debugPrint("Connesso! IP: ");
-  debugPrintln(WiFi.localIP().toString());
-
-  // dopo che il WiFi è connesso
-  debugPrintln("Imposto orario NTP...");
-  configTime(3600, 3600, "pool.ntp.org", "time.nist.gov");
-
-  struct tm t;
-  timeReady = getLocalTime(&t, 10000);
-
-  // Certificato root per Telegram HTTPS
-  client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
-
-  // Messaggio di avvio
-  bot.waitForResponse = 9000;
-  bot.sendMessage(CHAT_ID, "BOT ATTIVO!", "");
-
-  // Avvio modalita OTA
-  ArduinoOTA.setHostname("esp32-ota");
-  ArduinoOTA.begin();
-
-  // Avvio modalita TELNET
-  telnetServer.begin(); // Avvia server Telnet
-  telnetServer.setNoDelay(true);
-
-  // Log su file
-  spiffsOK = SPIFFS.begin(true); // true = formatta se non montabile [web:61]
-  logLine(INFO, String("SPIFFS: ") + (spiffsOK ? "OK" : "FAIL"), true, false);
-
-  debugPrintln("ArduinoOTA pronto");
 }
 
 bool deleteMessage(String chatId, String messageId)
@@ -266,6 +325,14 @@ String tailLog(int maxLines)
     out += lines[i % maxLines] + "\n";
   return out;
 }
+
+void handleDebug()
+{
+  debug = !debug;
+  logLine(INFO, debug ? "DEBUG ATTIVO" : "DEBUG DISATTIVO", true, false);
+}
+
+// telnet
 
 void handleTelnet()
 {
@@ -325,7 +392,6 @@ void handleTelnetCommand(const String &cmd)
   }
 }
 
-
 void telnetSendTail(const char *path, int maxLines)
 {
   File f = SPIFFS.open(path, FILE_READ);
@@ -335,23 +401,42 @@ void telnetSendTail(const char *path, int maxLines)
     return;
   }
 
-  // semplice: conserva ultime maxLines righe in ring buffer
-  String lines[200]; // alza/abbassa
-  maxLines = min(maxLines, 200);
+  if (maxLines <= 0)
+    maxLines = 50;
+  maxLines = min(maxLines, 200); // limite hard
+
+  // Ring buffer statico: non va sullo stack e non rialloca ogni volta
+  static String lines[200];
+  static bool inited = false;
+  if (!inited)
+  {
+    for (int i = 0; i < 200; i++)
+    {
+      lines[i].reserve(128); // riduce frammentazione/allocazioni [web:162]
+    }
+    inited = true;
+  }
+
   int idx = 0;
 
   while (f.available())
   {
-    lines[idx % maxLines] = f.readStringUntil('\n');
+    String s = f.readStringUntil('\n'); // leggi una riga [web:215]
+    s.trim();                           // toglie \r e spazi finali
+    lines[idx % maxLines] = s;          // ring buffer
     idx++;
   }
   f.close();
 
   int start = max(0, idx - maxLines);
   for (int i = start; i < idx; i++)
+  {
     telnetClient.println(lines[i % maxLines]);
+  }
   telnetClient.println("-- EOF (tail) --");
 }
+
+// sensori
 
 void leggiSensori(int umidita[2])
 {
@@ -359,6 +444,21 @@ void leggiSensori(int umidita[2])
   umidita[1] = analogRead(Pin_Sensore2);
 }
 
+void handleSensore()
+{
+  int umidita[2];
+
+  int dryValue = 3300;
+  int wetValue = 1050;
+
+  leggiSensori(umidita);
+
+  int umiditaSens1 = map(umidita[0], dryValue, wetValue, 0, 100);
+  int umiditaSens2 = map(umidita[1], dryValue, wetValue, 0, 100);
+  logLine(DEBUG_L, "umidità: " + String(umiditaSens1) + "% (" + String(umidita[0]) + "), " + String(umiditaSens2) + "% (" + String(umidita[1]) + ")", true, true);
+}
+
+// motori
 void accendiMotori(int who, int tempo)
 {
   if (who == 1)
@@ -401,33 +501,6 @@ void spegniMotori(int who)
   }
 }
 
-void handleSensore()
-{
-  int umidita[2];
-
-  int dryValue = 3300;
-  int wetValue = 1050;
-
-  leggiSensori(umidita);
-
-  int umiditaSens1 = map(umidita[0], dryValue, wetValue, 0, 100);
-  int umiditaSens2 = map(umidita[1], dryValue, wetValue, 0, 100);
-  logPrintln("umidità: " + String(umiditaSens1) + "% (" + String(umidita[0]) + "), " + String(umiditaSens2) + "% (" + String(umidita[1]) + ")");
-}
-
-void handleDebug()
-{
-  debug = !debug;
-  if (debug)
-  {
-    debugPrintln("Ho attivato la modalita DEBUG!");
-  }
-  else
-  {
-    debugPrintln("Ho disattivato la modalita DEBUG!");
-  }
-}
-
 void askTime(const String &who)
 {
   String keyboardJson = F(
@@ -446,6 +519,7 @@ void askTime(const String &who)
       keyboardJson);
 }
 
+// Messaggi telegram
 void handleCallBack(String text, String chatId, String messageId)
 {
   deleteMessage(chatId, messageId);
@@ -483,7 +557,8 @@ void handleCallBack(String text, String chatId, String messageId)
       seconds = 30;
     else if (text == "t_60")
       seconds = 60;
-    logPrintln("Avvio il motore " + String(botstate) + " per " + String(seconds) + " secondi");
+    logLine(DEBUG_L, "Avvio il motore " + String(botstate) + " per " + String(seconds) + " secondi", true, true);
+
     accendiMotori(int(botstate), seconds);
     botstate = IDLE;
   }
@@ -537,60 +612,6 @@ void handleMessage(String text, String chatId, String messageId)
   }
   else
   {
-    debugPrintln("Comando sconosciuto: " + text);
-  }
-}
-
-void loop()
-{
-  ArduinoOTA.handle();
-  unsigned long now = millis();
-
-  // Gestione nuove connessioni Telnet
-  handleTelnet();
-
-  // controllo spegnimento motori
-  if (offTimeMot1 != 0 && (long)(now - offTimeMot1) >= 0)
-  {
-    spegniMotori(1);
-  }
-
-  if (offTimeMot2 != 0 && (long)(now - offTimeMot2) >= 0)
-  {
-    spegniMotori(2);
-  }
-
-  // Gestione bot Telegram ogni botRequestDelay ms
-
-  if (now - lastTimeBotRan > (unsigned long)botRequestDelay)
-  {
-    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
-
-    lastTimeBotRan = now;
-
-    if (numNewMessages > 0)
-    {
-      for (int i = 0; i < numNewMessages; i++)
-      {
-        String type = bot.messages[i].type;
-        String text = bot.messages[i].text;
-        String chatId = bot.messages[i].chat_id;
-        int msgIdiNT = bot.messages[i].message_id;
-        String messageId = String(msgIdiNT); // ID per cancellare
-
-        if (type == "message")
-        {
-          debugPrint("Messaggio: ");
-          debugPrintln(text);
-          handleMessage(text, chatId, messageId);
-        }
-        else if (type == "callback_query")
-        {
-          debugPrint("Callback: ");
-          debugPrintln(text);
-          handleCallBack(text, chatId, messageId);
-        }
-      }
-    }
+    logLine(DEBUG_L, String("Comando sconosciuto: ") + text, true, true);
   }
 }
