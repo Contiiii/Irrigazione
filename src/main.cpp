@@ -1,5 +1,7 @@
-// Inserire check livello acqua, adattare percentuale acqua al 100, meteo
+// Inserire check livello acqua meteo
 // dimensiono file, ciclo di controllo, lettura corretta sensori
+
+// adattare percentuale acqua al 100, migliorato sistema di telnet, risolto bug che mandava 2 messaggi su telegram
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -39,6 +41,7 @@ BotState botstate = IDLE;
 bool timeReady = false;
 bool spiffsOK = false;
 const size_t MAX_LOG_SIZE = 400 * 1024;
+size_t logBytes = 0;
 
 // Dati WiFi
 const char *ssid = SECRET_WIFI_SSID;
@@ -67,6 +70,7 @@ int botRequestDelay = 3000;       // Tempo minimo tra due controlli per nuovi me
 unsigned long lastTimeBotRan = 0; // Memorizza l’ultima volta in cui il bot ha controllato nuovi messaggi
 unsigned long lastTelegramMs = 0;
 const unsigned long TELEGRAM_MIN_INTERVAL_MS = 1200; // ~1 msg/sec prudente
+long lastHandledUpdateId = 0;
 
 // Variabili motori
 unsigned long offTimeMot1 = 0;
@@ -83,6 +87,7 @@ void logLine(LogLevel lvl, const String &msg, bool newline, bool toTelegram);
 bool deleteMessage(String chatId, String messageId);
 String tailLog(int maxLines);
 void handleDebug();
+void initLogSize();
 
 // Prototipi di telnet
 void handleTelnet();
@@ -157,6 +162,8 @@ void setup()
 
   // Log su file
   spiffsOK = SPIFFS.begin(true); // true = formatta se non montabile [web:61]
+  if (spiffsOK)
+    initLogSize();
   logLine(INFO, String("SPIFFS: ") + (spiffsOK ? "OK" : "FAIL"), true, false);
 
   logLine(DEBUG_L, "ArduinoOTA pronto", true, false);
@@ -186,13 +193,19 @@ void loop()
   if (now - lastTimeBotRan > (unsigned long)botRequestDelay)
   {
     int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
-
     lastTimeBotRan = now;
 
     if (numNewMessages > 0)
     {
       for (int i = 0; i < numNewMessages; i++)
       {
+        // evita messaggi doppi
+        long uid = bot.messages[i].update_id;
+        if (uid <= lastHandledUpdateId)
+          continue;
+        lastHandledUpdateId = uid;
+
+        // salva tutte le informazioni
         String type = bot.messages[i].type;
         String text = bot.messages[i].text;
         String chatId = bot.messages[i].chat_id;
@@ -240,23 +253,22 @@ void appendLogFile(const String &line)
   if (!spiffsOK)
     return;
 
-  File r = SPIFFS.open("/log.txt", FILE_READ);
-  size_t sz = r ? (size_t)r.size() : 0;
-  if (r)
-    r.close();
-
-  if (sz > MAX_LOG_SIZE)
+  // Ruota PRIMA di scrivere, basandoti sul contatore in RAM
+  if (logBytes + line.length() > MAX_LOG_SIZE)
   {
-    SPIFFS.remove("/log.old"); // ok anche se non esiste
-    bool ok = SPIFFS.rename("/log.txt", "/log.old");
-    // opzionale: Serial.printf("rotate=%d\r\n", ok);
+    SPIFFS.remove("/log.old");             // ok anche se non esiste
+    SPIFFS.rename("/log.txt", "/log.old"); // backup dell’ultimo log
+    logBytes = 0;                          // riparti con un log nuovo
   }
 
   File f = SPIFFS.open("/log.txt", FILE_APPEND);
   if (!f)
     return;
-  f.print(line);
+
+  size_t written = f.print(line); // print() ritorna i byte scritti (valore utile per il contatore) [web:430]
   f.close();
+
+  logBytes += written;
 }
 
 void logLine(LogLevel lvl, const String &msg, bool newline = true, bool toTelegram = false)
@@ -307,9 +319,12 @@ bool deleteMessage(String chatId, String messageId)
 
   String url;
   url.reserve(220);
-  url = "https://api.telegram.org/bot" + String(BOTtoken) +
-        "/deleteMessage?chat_id=" + chatId +
-        "&message_id=" + messageId;
+  url = "https://api.telegram.org/bot";
+  url += BOTtoken;
+  url += "/deleteMessage?chat_id=";
+  url += chatId;
+  url += "&message_id=";
+  url += messageId;
 
   HTTPClient http;
   http.begin(client, url); // Usa lo stesso client sicuro del bot
@@ -354,11 +369,18 @@ void handleDebug()
   logLine(INFO, debug ? "DEBUG ATTIVO" : "DEBUG DISATTIVO", true, false);
 }
 
+void initLogSize()
+{
+  File r = SPIFFS.open("/log.txt", FILE_READ);
+  logBytes = r ? (size_t)r.size() : 0;
+  if (r)
+    r.close();
+}
+
 // telnet
 
 void handleTelnet()
 {
-  // Accetta nuovo client
   if (telnetServer.hasClient())
   {
     if (telnetClient && telnetClient.connected())
@@ -366,21 +388,48 @@ void handleTelnet()
     telnetClient = telnetServer.available();
     telnetClient.println("Telnet OK. Comandi: tail, clear, size");
   }
-  if (telnetClient && telnetClient.connected() && telnetClient.available())
+
+  if (!(telnetClient && telnetClient.connected()))
+    return;
+
+  while (telnetClient.available())
   {
-    char c = telnetClient.read();
-    if (c == '\r')
-      return;
-    if (c == '\n')
+    uint8_t c = (uint8_t)telnetClient.read();
+
+    // Telnet: IAC (255) introduce comandi/negoziazione, non testo [web:494]
+    if (c == 0xFF)
+    {
+      // spesso: IAC + (DO/DONT/WILL/WONT) + option => 3 byte totali [web:482]
+      if (telnetClient.available())
+        telnetClient.read();
+      if (telnetClient.available())
+        telnetClient.read();
+      continue;
+    }
+
+    // Ignora NUL (può arrivare in alcune varianti CR NUL)
+    if (c == 0x00)
+      continue;
+
+    // Fine riga: accetta CR o LF
+    if (c == '\r' || c == '\n')
     {
       telnetLine.trim();
-      handleTelnetCommand(telnetLine);
+      if (telnetLine.length() > 0)
+        handleTelnetCommand(telnetLine);
       telnetLine = "";
+      continue;
     }
-    else
+
+    // Backspace (utile con PuTTY/iTerminal quando modifichi la riga)
+    if (c == 0x08 || c == 0x7F)
     {
-      telnetLine += c;
+      if (telnetLine.length() > 0)
+        telnetLine.remove(telnetLine.length() - 1);
+      continue;
     }
+
+    telnetLine += (char)c;
   }
 }
 
@@ -478,6 +527,10 @@ void handleSensore()
 
   int umiditaSens1 = map(umidita[0], dryValue, wetValue, 0, 100);
   int umiditaSens2 = map(umidita[1], dryValue, wetValue, 0, 100);
+
+  umiditaSens1 = constrain(umiditaSens1, 0, 100);
+  umiditaSens2 = constrain(umiditaSens2, 0, 100);
+
   String msg;
   msg.reserve(160);
   msg = "umidità: ";
@@ -649,3 +702,28 @@ void handleMessage(String text, String chatId, String messageId)
     logLine(INFO, String("Comando sconosciuto: ") + text, true, true);
   }
 }
+
+/*
+
+Telegram: dedup e stabilità
+
+Miglioria ulteriore: dedup degli update salvando l’ultimo update_id/message_id gestito (capita che arrivino update duplicati o che una riconnessione ripeschi vecchi update). Telegram considera “confermato” un update quando chiami getUpdates con offset > update_id
+
+Logica motori: tipizzazione più chiara
+accendiMotori(int who, ...) usa who = 1/2/3 e in handleCallBack usi int(botstate). Funziona perché gli enum sono 1,2,3, ma è fragile: se cambi l’ordine dell’enum o aggiungi stati, rompi tutto.
+Miglioria: usa un enum separato tipo:
+
+cpp
+enum MotorSel { MOT1=1, MOT2=2, BOTH=3 };
+e non castare BotState in int.
+
+Checklist rapida “da fare”
+ Telegram: salva e controlla update_id per evitare re-processing.
+​
+
+ Clamp umidità 0..100.
+
+ Evita cast BotState -> int per i motori.
+
+Se vuoi, posso riscriverti solo le 3 funzioni “critiche” (appendLogFile, handleTelnet, loop Telegram) in versione più robusta senza cambiare il resto del tuo sketch.
+*/
