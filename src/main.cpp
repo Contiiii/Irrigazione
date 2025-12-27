@@ -1,7 +1,4 @@
-// Inserire check livello acqua meteo
-// dimensiono file, ciclo di controllo, lettura corretta sensori
-
-// adattare percentuale acqua al 100, migliorato sistema di telnet, risolto bug che mandava 2 messaggi su telegram
+// Migliorato sistema di accensione motori (messaggi telegram)
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -22,6 +19,17 @@
 #define Pin_Relay2 19
 
 // Variabili utilizzate
+struct DatiMeteo
+{
+  bool staPiovendo;
+  String condizioniMeteo;
+  float temperatura;
+  float pioggiaUltimaOra;
+  int umidita;
+  unsigned long ultimoAggiornamento;
+  bool datiValidi;
+};
+
 enum BotState
 {
   IDLE,
@@ -29,6 +37,7 @@ enum BotState
   ASK_TIME_MOT2,
   ASK_TIME_BOTH
 };
+
 enum LogLevel
 {
   INFO,
@@ -37,11 +46,33 @@ enum LogLevel
   ERROR_L
 };
 
+enum MotorSel
+{
+  Motore_1 = 1,
+  Motore_2 = 2,
+  Entrambi_i_Motori = 3
+};
+
 BotState botstate = IDLE;
+MotorSel pendingMotor = Motore_1;
 bool timeReady = false;
 bool spiffsOK = false;
 const size_t MAX_LOG_SIZE = 400 * 1024;
 size_t logBytes = 0;
+
+// Dati Pioggia
+DatiMeteo meteo;                                          // variabile per contenere i dati del meteo
+bool bloccoIrrigazione = false;                           // blocca irrigazione quando piove
+unsigned long scadenzaBloccoIrrigazione = 0;              // tempo dal blocco
+const unsigned long DurataBloccoPioggia = 1000 * 60 * 60; // durata blocco 1 ora
+
+const unsigned long intervallo_Refresh_Giorno = 1000 * 60 * 60;    // di giorno il refresh è ogni ora
+const unsigned long intervallo_Refresh_Notte = 1000 * 60 * 60 * 3; // di notte il refresh è ogni 3 ore
+const unsigned long durata_Cash_Valida = 1000 * 60 * 30;           // la cash dura 30 minuti
+const int soglia_Minima_Pioggia = 0.5;
+
+const int ora_Inizio_Giorno = 6; // indica l'orario di inizio giorno
+const int ora_Fine_Giorno = 23;  // indica l'orario di fine giorno
 
 // Dati WiFi
 const char *ssid = SECRET_WIFI_SSID;
@@ -49,8 +80,7 @@ const char *password = SECRET_WIFI_PASS;
 
 // Configurazione Meteo
 String openWeatherMapApiKey = SECRET_API_OPENWEATHER;
-String city = "Vernasca";  // O la tua città
-String countryCode = "IT"; // Codice paese
+String city = "Vernasca,IT"; // Città
 
 // Token del bot Telegram e chat ID
 #define BOTtoken SECRET_BOT_TOKEN
@@ -107,6 +137,16 @@ void askTime(const String &who);
 void handleCallBack(String text, String chatId, String messageId);
 void handleMessage(String text, String chatId, String messageId);
 
+// Rilevo meteo
+bool rilevoMeteo();
+unsigned long refreshData(int ora);
+bool validitaCashMeteo();
+bool aggiornamentoMeteoServe(bool forza);
+void attivoBloccoPioggia();
+void controlloBloccoPioggia();
+bool irrigazioneConsentita();
+void handleMeteo();
+
 // ---- FUNZIONI DI DEBUG (Serial + Telnet) ----
 void setup()
 {
@@ -145,10 +185,11 @@ void setup()
   timeReady = getLocalTime(&t, 10000);
 
   // Certificato root per Telegram HTTPS
+  client.setHandshakeTimeout(15);
   client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+  bot.waitForResponse = 5000;
 
   // Messaggio di avvio
-  bot.waitForResponse = 9000;
   bot.sendMessage(CHAT_ID, "BOT ATTIVO!", "");
 
   // Avvio modalita OTA
@@ -615,6 +656,7 @@ void handleCallBack(String text, String chatId, String messageId)
   {
     if (botstate != IDLE)
       return; // se sto aspettando un tempo ignora i messaggi del motore
+    pendingMotor = Motore_1;
     botstate = ASK_TIME_MOT1;
     askTime("motore 1");
   }
@@ -622,6 +664,7 @@ void handleCallBack(String text, String chatId, String messageId)
   {
     if (botstate != IDLE)
       return;
+    pendingMotor = Motore_2;
     botstate = ASK_TIME_MOT2;
     askTime("motore 2");
   }
@@ -629,6 +672,7 @@ void handleCallBack(String text, String chatId, String messageId)
   {
     if (botstate != IDLE)
       return;
+    pendingMotor = Entrambi_i_Motori;
     botstate = ASK_TIME_BOTH;
     askTime("entrambi i motori?");
   }
@@ -644,9 +688,9 @@ void handleCallBack(String text, String chatId, String messageId)
       seconds = 30;
     else if (text == "t_60")
       seconds = 60;
-    logLine(INFO, "Avvio il motore " + String(botstate) + " per " + String(seconds) + " secondi", true, true);
+    logLine(INFO, "Avvio il motore " + String(pendingMotor) + " per " + String(seconds) + " secondi", true, true);
 
-    accendiMotori(int(botstate), seconds);
+    accendiMotori((int)pendingMotor, seconds);
     botstate = IDLE;
   }
 }
@@ -657,7 +701,13 @@ void handleMessage(String text, String chatId, String messageId)
   deleteMessage(chatId, messageId);
   if (text == "/meteo")
   {
-    /* handleMeteo(); */
+    handleMeteo();
+  }
+  else if (text == "/updatemeteo")
+  {
+    meteo.datiValidi = false;
+    bool ok = rilevoMeteo();
+    bot.sendMessage(CHAT_ID, ok ? "Aggiornamento meteo OK." : "Aggiornamento meteo FALLITO.", "");
   }
   else if (text == "/sensore")
   {
@@ -703,27 +753,240 @@ void handleMessage(String text, String chatId, String messageId)
   }
 }
 
+// Gestione Meteo
+bool rilevoMeteo()
+{ // aggiorna la variabile meteo
+  if (WiFi.status() != WL_CONNECTED)
+    return false;
+
+  String url;
+  url.reserve(160);
+  url = "http://api.openweathermap.org/data/2.5/weather?q=";
+  url += city;
+  url += "&appid=";
+  url += openWeatherMapApiKey;
+  url += "&units=metric&lang=it";
+
+  HTTPClient http;
+  http.setTimeout(5000);
+  http.begin(url);
+
+  int httpCode = http.GET();
+  if (httpCode != 200)
+  {
+    http.end();
+    logLine(ERROR_L, "Errore HTTP: " + String(httpCode), true, false);
+    return false;
+  }
+
+  // CONTROLLO NULLPTR CRITICO
+  WiFiClient *stream = http.getStreamPtr();
+  if (!stream)
+  {
+    http.end();
+    logLine(ERROR_L, "Stream non disponibile", true, false);
+    return false;
+  }
+
+  // FILTRO JSON ottimizzato
+  JsonDocument filter;
+  filter["weather"][0]["main"] = true;
+  filter["main"]["temp"] = true;
+  filter["main"]["humidity"] = true;
+  filter["rain"]["1h"] = true;
+  filter["rain"]["3h"] = true;
+
+  JsonDocument doc;
+
+  DeserializationError error = deserializeJson(doc, *stream, DeserializationOption::Filter(filter));
+  http.end();
+
+  if (error)
+  {
+    logLine(ERROR_L, "Errore JSON: " + String(error.c_str()), true, false);
+    return false;
+  }
+
+  // Operatore | per gestione sicura valori opzionali
+  String main = doc["weather"][0]["main"] | "Unknown";
+  float temp = doc["main"]["temp"] | 0.0f;
+  int umidita = doc["main"]["humidity"] | 0;
+  float r1h = doc["rain"]["1h"] | 0.0f;
+  float r3h = doc["rain"]["3h"] | 0.0f;
+
+  bool piove = (main == "Rain" || main == "Drizzle" || r1h >= soglia_Minima_Pioggia);
+
+  meteo.condizioniMeteo = main;
+  meteo.temperatura = temp;
+  meteo.umidita = umidita;
+  meteo.pioggiaUltimaOra = r1h;
+  meteo.staPiovendo = piove;
+  meteo.ultimoAggiornamento = millis();
+  meteo.datiValidi = true;
+
+  return true;
+}
+
+unsigned long refreshData(int ora)
+{ // restituisce l'intervallo di refresh appropiato
+  if (ora >= ora_Inizio_Giorno && ora <= ora_Fine_Giorno)
+    return intervallo_Refresh_Giorno;
+  return intervallo_Refresh_Notte;
+}
+
+bool validitaCashMeteo()
+{
+  if (!meteo.datiValidi)
+    return false;
+  unsigned long elapsed = millis() - meteo.ultimoAggiornamento;
+  return elapsed <= durata_Cash_Valida;
+}
+
+bool aggiornamentoMeteoServe(bool forza = false)
+{
+  if (forza || !validitaCashMeteo())
+  {
+    return rilevoMeteo();
+  }
+  return true;
+}
+
+void attivoBloccoPioggia()
+{
+  bloccoIrrigazione = true;
+  scadenzaBloccoIrrigazione = millis() + DurataBloccoPioggia;
+}
+
+void controlloBloccoPioggia()
+{
+  if (bloccoIrrigazione)
+  {
+    unsigned long elapsed = millis() - (scadenzaBloccoIrrigazione - DurataBloccoPioggia);
+    if (elapsed >= DurataBloccoPioggia)
+    {
+      bloccoIrrigazione = false;
+      scadenzaBloccoIrrigazione = 0;
+    }
+  }
+}
+
+bool irrigazioneConsentita()
+{
+  if (bloccoIrrigazione)
+    return false;
+  if (!meteo.datiValidi)
+    return false;
+  if (meteo.staPiovendo)
+    return false;
+  return true;
+}
+
+void handleMeteo()
+{
+  aggiornamentoMeteoServe();
+
+  if (!meteo.datiValidi)
+  {
+    logLine(ERROR_L, "Meteo non disponibile", true, true);
+    return;
+  }
+
+  unsigned long etaMin = (millis() - meteo.ultimoAggiornamento) / 60000;
+
+  String msg;
+  msg.reserve(300);
+  msg += "METEO " + city + "\n";
+  msg += "Condizioni: " + meteo.condizioniMeteo + "\n";
+  msg += "Temp: " + String(meteo.temperatura, 2) + " °C\n";
+  msg += "Umidita: " + String(meteo.umidita) + "%\n";
+  msg += "Pioggia 1h: " + String(meteo.pioggiaUltimaOra, 2) + " mm\n";
+  msg += "Aggiornato: " + String(etaMin) + " min fa\n";
+
+  if (bloccoIrrigazione)
+  {
+    unsigned long elapsed = millis() - (scadenzaBloccoIrrigazione - DurataBloccoPioggia);
+    
+    if (elapsed < DurataBloccoPioggia)
+    {
+      unsigned long remaining = DurataBloccoPioggia - elapsed;
+      unsigned long remMin = remaining / 60000;
+      msg += "Blocco irrigazione: " + String(remMin) + " min\n";
+    }
+    else
+    {
+      msg += "Blocco irrigazione: scaduto\n";
+    }
+  }
+
+  bot.sendMessage(CHAT_ID, msg, "");
+}
+
 /*
+yield();
 
-Telegram: dedup e stabilità
+in caso di connessione che salta
+void checkWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.reconnect();
+    delay(5000);
+  }
+}
 
-Miglioria ulteriore: dedup degli update salvando l’ultimo update_id/message_id gestito (capita che arrivino update duplicati o che una riconnessione ripeschi vecchi update). Telegram considera “confermato” un update quando chiami getUpdates con offset > update_id
+in caso di mancata risposta dei secondi del motore
+unsigned long stateTimeout = 0;
+if (botstate != IDLE && millis() > stateTimeout) {
+  botstate = IDLE;
+}
 
-Logica motori: tipizzazione più chiara
-accendiMotori(int who, ...) usa who = 1/2/3 e in handleCallBack usi int(botstate). Funziona perché gli enum sono 1,2,3, ma è fragile: se cambi l’ordine dell’enum o aggiungi stati, rompi tutto.
-Miglioria: usa un enum separato tipo:
-
-cpp
-enum MotorSel { MOT1=1, MOT2=2, BOTH=3 };
-e non castare BotState in int.
-
-Checklist rapida “da fare”
- Telegram: salva e controlla update_id per evitare re-processing.
+Impatto: MEDIO - Previene doppi click accidentali che possono avviare motori due volte:
 ​
+static unsigned long lastCallback = 0;
+if (millis() - lastCallback < 500) return;
+lastCallback = millis();
 
- Clamp umidità 0..100.
 
- Evita cast BotState -> int per i motori.
+POLLING ADATTIVO (di notte alto e quanod messaggio veloce per 5 minuti) (modifica con messaggio telegram, motori accesi, telnet connesso, sensori rilevano irrigazione)
 
-Se vuoi, posso riscriverti solo le 3 funzioni “critiche” (appendLogFile, handleTelnet, loop Telegram) in versione più robusta senza cambiare il resto del tuo sketch.
+Aggiungere emoji nei log e nei messaggi
+
+Aggiungere lettore di warning o error nei log
+
+crear ciclo di controllo
+
+Creare lettura corretta sensori (leggerli 10 volte e farne una media)
+
+Creare controllo livello acqua
+
+wifi Sleep mode solo di notte
+
+Utilizzare doppio core
+
+
+aggiungere emoji per log piu belli
+
+correggere bug di avvio motori
+
+check notturno che manda statistiche, qunait warning e error, umidità minima massima e media, irrigazioni totali
+
+comando per leggere solo  log con  errori o warning
+
+sistemare boot con messaggi su telnet
+
+warning sensore disconnesso o valori anomali
+
+umidità critica
+
+temperatura esp32 alta
+
+wifi debole o disconnesso o impossibile connettersi
+
+telegram irraggiungibile o non risponde
+
+spazio memoria piccolo
+
+motore attivo per troppo tempo
+
+irrigazioni troppo frequenti
+
+usare il core 0
 */
