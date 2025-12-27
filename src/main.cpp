@@ -1,4 +1,4 @@
-// Migliorato sistema di accensione motori (messaggi telegram)
+// Corretta lettura sensori, controllo valori umidita (umidita critica, sensore 1 o 2 disconnesso), aggiunta funzione telegram /health, aggiunto controllo temperatura esp32
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -74,6 +74,71 @@ const int soglia_Minima_Pioggia = 0.5;
 const int ora_Inizio_Giorno = 6; // indica l'orario di inizio giorno
 const int ora_Fine_Giorno = 23;  // indica l'orario di fine giorno
 
+// variabili Healt
+struct SystemHealth
+{
+  // Sensori
+  bool sensore1Disconnesso : 1;
+  bool sensore2Disconnesso : 1;
+  bool umiditaCritica : 1;
+
+  // Temperatura ESP32
+  bool temperaturaElevata : 1;
+
+  // WiFi
+  bool wifiDebole : 1;
+  bool wifiDisconnesso : 1;
+
+  // Telegram
+  bool telegramIrraggiungibile : 1;
+
+  // Memoria
+  bool memoriaInsufficiente : 1;
+
+  // Motori
+  bool motoreAttivoTroppoTempo : 1;
+
+  // Irrigazioni
+  bool irrigazioniTroppoFrequenti : 1;
+
+  // Valori (solo quelli necessari)
+  int8_t rssi; // potenza segnale wifi
+  float temperaturaESP32;
+  uint16_t spiffsFreeKB;
+  uint8_t irrigazioniOggi;
+
+  // Timestamp ottimizzati (usa solo quando serve)
+  unsigned long lastSensorCheck;
+  unsigned long lastTempCheck;
+  unsigned long lastWifiCheck;
+  unsigned long lastMemoryCheck;
+  unsigned long lastIrrigationTime;
+  unsigned long lastDayReset;
+  unsigned long motore1StartTime;
+  unsigned long motore2StartTime;
+  unsigned long lastSuccessfulTelegramComm;
+};
+
+SystemHealth health = {0};
+
+const int8_t RSSI_DEBOLE = -75;
+const int8_t RSSI_CRITICO = -85;
+const float TEMP_WARNING = 75.0;
+const float TEMP_CRITICAL = 85.0;
+const uint8_t UMIDITA_CRITICA = 15;
+const uint16_t MAX_MOTOR_SECONDS = 600;       // 15 min in secondi
+const uint32_t MIN_IRRIGATION_MS = 7200000UL; // 2 ore
+const uint8_t MAX_IRRIGATIONS_DAY = 10;
+const uint16_t MIN_FREE_KB = 50;
+const uint16_t SENSOR_LOW = 500;
+const uint16_t SENSOR_HIGH = 4000;
+
+// Intervalli check (ottimizzati)
+const uint8_t CHECK_TEMP = 30;
+const uint8_t CHECK_WIFI = 10;
+const uint16_t CHECK_MEMORY = 300;
+const uint8_t CHECK_MOTOR = 5;
+
 // Dati WiFi
 const char *ssid = SECRET_WIFI_SSID;
 const char *password = SECRET_WIFI_PASS;
@@ -101,6 +166,9 @@ unsigned long lastTimeBotRan = 0; // Memorizza l’ultima volta in cui il bot ha
 unsigned long lastTelegramMs = 0;
 const unsigned long TELEGRAM_MIN_INTERVAL_MS = 1200; // ~1 msg/sec prudente
 long lastHandledUpdateId = 0;
+unsigned long lastMotorCommandTime = 0;
+const unsigned long MOTOR_DEBOUNCE_INTERVAL = 2000; // 2 secondi tra comandi
+bool motorOperationInProgress = false;
 
 // Variabili motori
 unsigned long offTimeMot1 = 0;
@@ -146,6 +214,11 @@ void attivoBloccoPioggia();
 void controlloBloccoPioggia();
 bool irrigazioneConsentita();
 void handleMeteo();
+
+// check sistem Health
+void validazioneSensori(int raw1, int raw2);
+void checkTemperaturaESP32();
+void handleHealth();
 
 // ---- FUNZIONI DI DEBUG (Serial + Telnet) ----
 void setup()
@@ -229,8 +302,10 @@ void loop()
     spegniMotori(2);
   }
 
-  // Gestione bot Telegram ogni botRequestDelay ms
+  // Healt Cheack
+  checkTemperaturaESP32();
 
+  // Gestione bot Telegram ogni botRequestDelay ms
   if (now - lastTimeBotRan > (unsigned long)botRequestDelay)
   {
     int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
@@ -553,8 +628,24 @@ void telnetSendTail(const char *path, int maxLines)
 
 void leggiSensori(int umidita[2])
 {
-  umidita[0] = analogRead(Pin_Sensore1);
-  umidita[1] = analogRead(Pin_Sensore2);
+  const int NUM_SAMPLES = 10;           // Numero di campioni per media
+  const int DELAY_BETWEEN_SAMPLES = 10; // 10ms tra letture
+
+  long sum1 = 0;
+  long sum2 = 0;
+
+  for (int i = 0; i < NUM_SAMPLES; i++)
+  {
+    sum1 += analogRead(Pin_Sensore1);
+    sum2 += analogRead(Pin_Sensore2);
+    delay(DELAY_BETWEEN_SAMPLES); // Piccolo ritardo tra letture
+  }
+
+  // ✅ Calcola media
+  umidita[0] = sum1 / NUM_SAMPLES;
+  umidita[1] = sum2 / NUM_SAMPLES;
+
+  validazioneSensori(umidita[0], umidita[1]);
 }
 
 void handleSensore()
@@ -583,6 +674,14 @@ void handleSensore()
   msg += "% (";
   msg += umidita[1];
   msg += ")";
+
+  if (health.sensore1Disconnesso)
+    msg += " ⚠️S1"; // Sensore 1 scollegato
+  if (health.sensore2Disconnesso)
+    msg += " ⚠️S2"; // Sensore 2 scollegato
+  if (health.umiditaCritica)
+    msg += " 🚨CRITICA";
+
   logLine(INFO, msg, true, true);
 }
 
@@ -652,10 +751,29 @@ void handleCallBack(String text, String chatId, String messageId)
 {
   deleteMessage(chatId, messageId);
 
+  // Verifica se operazione motore in corso
+  if (motorOperationInProgress)
+  {
+    bot.sendMessage(CHAT_ID, "Attendi... operazione in corso.", "");
+    return;
+  }
+
+  // Ignora click troppo ravvicinati
+  unsigned long now = millis();
+  if (now - lastMotorCommandTime < MOTOR_DEBOUNCE_INTERVAL)
+  {
+    logLine(WARN, "Click ignorato (debounce)", true, false);
+    return;
+  }
+
   if (text == "mot1_on")
   {
     if (botstate != IDLE)
       return; // se sto aspettando un tempo ignora i messaggi del motore
+
+    motorOperationInProgress = true;
+    lastMotorCommandTime = now;
+
     pendingMotor = Motore_1;
     botstate = ASK_TIME_MOT1;
     askTime("motore 1");
@@ -664,6 +782,10 @@ void handleCallBack(String text, String chatId, String messageId)
   {
     if (botstate != IDLE)
       return;
+
+    motorOperationInProgress = true;
+    lastMotorCommandTime = now;
+
     pendingMotor = Motore_2;
     botstate = ASK_TIME_MOT2;
     askTime("motore 2");
@@ -672,26 +794,40 @@ void handleCallBack(String text, String chatId, String messageId)
   {
     if (botstate != IDLE)
       return;
+
+    motorOperationInProgress = true;
+    lastMotorCommandTime = now;
+
     pendingMotor = Entrambi_i_Motori;
     botstate = ASK_TIME_BOTH;
-    askTime("entrambi i motori?");
+    askTime("entrambi i motori");
   }
 
   else if (text.startsWith("t_"))
   {
     if (botstate == IDLE)
-      return; // se non ho scelto un motore ignora i tempi
+    {
+      motorOperationInProgress = false;
+      return;
+    } // se non ho scelto un motore ignora i tempi
+
     int seconds = 0;
+
     if (text == "t_10")
       seconds = 10;
+
     else if (text == "t_30")
       seconds = 30;
+
     else if (text == "t_60")
       seconds = 60;
+      
     logLine(INFO, "Avvio il motore " + String(pendingMotor) + " per " + String(seconds) + " secondi", true, true);
 
     accendiMotori((int)pendingMotor, seconds);
     botstate = IDLE;
+
+    motorOperationInProgress = false;
   }
 }
 
@@ -720,6 +856,10 @@ void handleMessage(String text, String chatId, String messageId)
   else if (text == "/manutenzione")
   {
     /* handleManutenzione(); */
+  }
+  else if (text == "/health")
+  {
+    handleHealth();
   }
   else if (text == "/test")
   {
@@ -905,7 +1045,7 @@ void handleMeteo()
   if (bloccoIrrigazione)
   {
     unsigned long elapsed = millis() - (scadenzaBloccoIrrigazione - DurataBloccoPioggia);
-    
+
     if (elapsed < DurataBloccoPioggia)
     {
       unsigned long remaining = DurataBloccoPioggia - elapsed;
@@ -918,6 +1058,150 @@ void handleMeteo()
     }
   }
 
+  bot.sendMessage(CHAT_ID, msg, "");
+}
+
+// check sistem Health
+void validazioneSensori(int raw1, int raw2)
+{
+  static bool lastSensor1Error = false;
+  static bool lastSensor2Error = false;
+
+  // Sensore 1
+  bool sensor1Error = (raw1 < SENSOR_LOW || raw1 > SENSOR_HIGH);
+
+  if (sensor1Error && !lastSensor1Error)
+  {
+    health.sensore1Disconnesso = true;
+    logLine(WARN, "⚠️ Sensore 1 disconnesso (val: " + String(raw1) + ")", true, true);
+  }
+
+  else if (!sensor1Error)
+  {
+    health.sensore1Disconnesso = false;
+  }
+
+  lastSensor1Error = sensor1Error;
+
+  // Sensore 2
+  bool sensor2Error = (raw2 < SENSOR_LOW || raw2 > SENSOR_HIGH);
+
+  if (sensor2Error && !lastSensor2Error)
+  {
+    health.sensore2Disconnesso = true;
+    logLine(WARN, "⚠️ Sensore 2 disconnesso (val: " + String(raw2) + ")", true, true);
+  }
+  else if (!sensor2Error)
+  {
+    health.sensore2Disconnesso = false;
+  }
+
+  lastSensor2Error = sensor2Error;
+
+  // check umidita critica
+  if (!sensor1Error && !sensor2Error)
+  {
+    int pct1 = map(constrain(raw1, 1050, 3300), 3300, 1050, 0, 100);
+    int pct2 = map(constrain(raw2, 1050, 3300), 3300, 1050, 0, 100);
+
+    // Umidità sotto 15% su ALMENO UN sensore? → CRITICA
+    bool critica = (pct1 < UMIDITA_CRITICA || pct2 < UMIDITA_CRITICA);
+
+    // Se NUOVA condizione critica → Logga allarme
+    if (critica && !health.umiditaCritica)
+    {
+      health.umiditaCritica = true;
+      logLine(ERROR_L, "🚨 UMIDITA' CRITICA: Sens1=" + String(pct1) + "% Sens2=" + String(pct2) + "%", true, true);
+    }
+    // Se umidità torna OK → Resetta flag
+    else if (!critica)
+    {
+      health.umiditaCritica = false;
+    }
+  }
+}
+
+void checkTemperaturaESP32()
+{
+  static uint32_t lastCheck = 0;
+  uint32_t now = millis();
+
+  if ((now - lastCheck) < (CHECK_TEMP * 1000UL))
+    return;
+
+  lastCheck = now;
+
+  health.temperaturaESP32 = temperatureRead();
+
+  if (health.temperaturaESP32 > TEMP_CRITICAL)
+  {
+    // Prima volta che supera 85°C? → Logga allarme
+    if (!health.temperaturaElevata)
+    {
+      health.temperaturaElevata = true;
+      logLine(ERROR_L, "🔥 TEMP ESP32 CRITICA: " + String(health.temperaturaESP32, 1) + "°C", true, true);
+    }
+    // 🛡️ PROTEZIONE: Riduci frequenza CPU per raffreddare
+    setCpuFrequencyMhz(80); // Da 240MHz → 80MHz (riduce consumo/calore 67%)
+    logLine(WARN, "⚙️ CPU ridotta a 80MHz per raffreddamento", true, false);
+  }
+  else if (health.temperaturaESP32 > TEMP_WARNING)
+  {
+    // Prima volta che supera 75°C? → Logga avviso
+    if (!health.temperaturaElevata)
+    {
+      health.temperaturaElevata = true;
+      logLine(WARN, "⚠️ Temp ESP32 elevata: " + String(health.temperaturaESP32, 1) + "°C", true, false);
+    }
+  }
+  else if (health.temperaturaESP32 < (TEMP_WARNING - 5.0))
+  {
+    // Se temperatura scende sotto 70°C → Resetta flag
+    if (health.temperaturaElevata)
+    {
+      health.temperaturaElevata = false;
+      logLine(INFO, "✅ Temp ESP32 OK: " + String(health.temperaturaESP32, 1) + "°C", true, false);
+
+      // Ripristina CPU a velocità normale se era stata ridotta
+      if (getCpuFrequencyMhz() < 240)
+      {
+        setCpuFrequencyMhz(240);
+        logLine(INFO, "⚙️ CPU ripristinata a 240MHz", true, false);
+      }
+    }
+  }
+}
+
+void handleHealth() 
+{
+  String msg;
+  msg.reserve(300);
+  msg = "=== SYSTEM HEALTH ===\n\n";
+  
+  // 🌡️ TEMPERATURA ESP32
+  msg += "ESP32: " + String(health.temperaturaESP32, 1) + "°C";
+  if (health.temperaturaElevata) {
+    msg += " 🔥";  // Icona se temperatura alta
+  }
+  msg += "\n";
+  
+  // 📶 WiFi
+  msg += "WiFi: " + String(health.rssi) + " dBm";
+  if (health.wifiDebole) msg += " ⚠️";
+  msg += "\n";
+  
+  // 💾 Memoria
+  msg += "Memoria: " + String(health.spiffsFreeKB) + " KB\n";
+  
+  // 🚿 Irrigazioni
+  msg += "Irrigazioni oggi: " + String(health.irrigazioniOggi) + "\n";
+  
+  // ⚠️ AVVISI ATTIVI
+  if(health.sensore1Disconnesso) msg += "\n⚠️ Sensore 1 disconnesso";
+  if(health.sensore2Disconnesso) msg += "\n⚠️ Sensore 2 disconnesso";
+  if(health.umiditaCritica) msg += "\n🚨 Umidità critica";
+  if(health.memoriaInsufficiente) msg += "\n💾 Memoria insufficiente";
+  
   bot.sendMessage(CHAT_ID, msg, "");
 }
 
@@ -938,13 +1222,6 @@ if (botstate != IDLE && millis() > stateTimeout) {
   botstate = IDLE;
 }
 
-Impatto: MEDIO - Previene doppi click accidentali che possono avviare motori due volte:
-​
-static unsigned long lastCallback = 0;
-if (millis() - lastCallback < 500) return;
-lastCallback = millis();
-
-
 POLLING ADATTIVO (di notte alto e quanod messaggio veloce per 5 minuti) (modifica con messaggio telegram, motori accesi, telnet connesso, sensori rilevano irrigazione)
 
 Aggiungere emoji nei log e nei messaggi
@@ -953,14 +1230,11 @@ Aggiungere lettore di warning o error nei log
 
 crear ciclo di controllo
 
-Creare lettura corretta sensori (leggerli 10 volte e farne una media)
-
 Creare controllo livello acqua
 
 wifi Sleep mode solo di notte
 
 Utilizzare doppio core
-
 
 aggiungere emoji per log piu belli
 
@@ -972,12 +1246,6 @@ comando per leggere solo  log con  errori o warning
 
 sistemare boot con messaggi su telnet
 
-warning sensore disconnesso o valori anomali
-
-umidità critica
-
-temperatura esp32 alta
-
 wifi debole o disconnesso o impossibile connettersi
 
 telegram irraggiungibile o non risponde
@@ -987,6 +1255,4 @@ spazio memoria piccolo
 motore attivo per troppo tempo
 
 irrigazioni troppo frequenti
-
-usare il core 0
 */
