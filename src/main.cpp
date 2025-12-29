@@ -1,4 +1,4 @@
-// check motori accesi per troppo tempo, implementata l'auto irrigazione
+// implementato controllo frequenza irrigazione nuova deleteMessage
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -76,6 +76,17 @@ const int soglia_Minima_Pioggia = 0.5;
 const int ora_Inizio_Giorno = 6; // indica l'orario di inizio giorno
 const int ora_Fine_Giorno = 23;  // indica l'orario di fine giorno
 
+// count Irrigazioni
+enum IrrigationBlockReason : uint8_t
+{
+  IRR_OK = 0,
+  IRR_RAIN_BLOCK,
+  IRR_TOO_SOON,
+  IRR_DAY_LIMIT
+};
+
+static uint32_t g_nextDayCheckMs = 0; // rate-limit del check giorno
+
 // variabili Healt
 struct SystemHealth
 {
@@ -106,6 +117,12 @@ struct SystemHealth
   // Irrigazioni
   bool irrigazioniTroppoFrequenti : 1;
 
+  uint8_t irrigazioniOggiMot1;
+  uint8_t irrigazioniOggiMot2;
+
+  unsigned long lastIrrMot1;
+  unsigned long lastIrrMot2;
+
   // Valori (solo quelli necessari)
   int8_t rssi; // potenza segnale wifi
   float temperaturaESP32;
@@ -131,8 +148,8 @@ const int8_t RSSI_CRITICO = -85;
 const float TEMP_WARNING = 75.0;
 const float TEMP_CRITICAL = 85.0;
 const uint8_t UMIDITA_CRITICA = 15;
-const uint16_t MAX_MOTOR_SECONDS = 600;       // 10 min in secondi
-const uint32_t MIN_IRRIGATION_MS = 7200000UL; // 2 ore
+const uint16_t MAX_MOTOR_SECONDS = 600;    // 10 min in secondi
+const uint32_t MIN_IRRIGATION_MS = 120000; // 1 ore 3600000UL
 const uint8_t MAX_IRRIGATIONS_DAY = 10;
 const uint16_t MIN_FREE_KB = 50;
 const uint16_t SENSOR_LOW = 500;
@@ -140,11 +157,25 @@ const uint16_t SENSOR_HIGH = 4000;
 const uint8_t TELEGRAM_MAX_FAILURES = 5;
 
 // Intervalli check (ottimizzati)
-const uint8_t CHECK_TEMP = 30;
-const uint8_t CHECK_WIFI = 10;
-const uint16_t CHECK_MEMORY = 300;
-const uint8_t CHECK_MOTOR = 5;
-const uint8_t CHECK_TELEGRAM = 60;
+const uint8_t CHECK_TEMP = 30UL;
+const uint8_t CHECK_WIFI = 10UL;
+const uint16_t CHECK_MEMORY = 300UL;
+const uint8_t CHECK_MOTOR = 5UL;
+const uint8_t CHECK_TELEGRAM = 60UL;
+const uint8_t CHECK_SENS = 20UL;
+
+// delete Message
+WiFiClientSecure deleteClient;                       //  Client dedicato SOLO alle delete (non usare lo stesso "client" del bot)
+static const uint32_t DELETE_MIN_INTERVAL_MS = 1200; // allineato al tuo TELEGRAM_MIN_INTERVAL_MS
+struct DeleteReq
+{
+  char chatId[24];
+  uint32_t msgId;
+  uint8_t retries;
+};
+static DeleteReq delQ[12];
+static uint8_t delHead = 0, delTail = 0, delCount = 0;
+static uint32_t delNextMs = 0;
 
 // variabili per irrigazione automatica
 struct AutoZone
@@ -200,7 +231,6 @@ bool debug = false;
 String getTime();
 void appendLogFile(const String &line);
 void logLine(LogLevel lvl, const String &msg, bool newline, bool toTelegram);
-bool deleteMessage(String chatId, String messageId);
 String tailLog(int maxLines);
 void handleDebug();
 void initLogSize();
@@ -244,7 +274,16 @@ int safeGetUpdates();
 void checkMemory();
 void checkMotori();
 
-// ---- FUNZIONI DI DEBUG (Serial + Telnet) ----
+// check irrigazioni
+uint32_t computeDayId();
+void dailyResetTick(uint32_t nowMs);
+bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, IrrigationBlockReason &reason, uint8_t &motBlocked, uint16_t &waitMin);
+
+// delete Message
+static bool enqueueDelete(const String &chatId, uint32_t msgId);
+static bool deleteNow(const char *chatId, uint32_t msgId);
+static void processDeleteQueue();
+
 void setup()
 {
   Serial.begin(115200);
@@ -286,6 +325,10 @@ void setup()
   client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
   bot.waitForResponse = 5000;
 
+  // delete Message
+  deleteClient.setHandshakeTimeout(30);
+  deleteClient.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+
   // Messaggio di avvio
   bot.sendMessage(CHAT_ID, "BOT ATTIVO!", "");
 
@@ -312,6 +355,8 @@ void loop()
   ArduinoOTA.handle();
   unsigned long now = millis();
 
+  dailyResetTick(millis());
+
   // Gestione nuove connessioni Telnet
   handleTelnet();
 
@@ -332,8 +377,11 @@ void loop()
   checkMemory();
   checkMotori();
 
+  // elimina i messaggi
+  processDeleteQueue();
+
   static uint32_t lastAutoSense = 0;
-  if (now - lastAutoSense >= 30UL * 1000UL)
+  if (now - lastAutoSense >= CHECK_SENS * 1000UL)
   {
     lastAutoSense = now;
     handleSensore(false);
@@ -468,32 +516,6 @@ void logLine(LogLevel lvl, const String &msg, bool newline = true, bool toTelegr
       lastTelegramMs = millis();
     }
   }
-}
-
-bool deleteMessage(String chatId, String messageId)
-{
-  if (WiFi.status() != WL_CONNECTED)
-    return false;
-
-  String url;
-  url.reserve(256);
-  url = "https://api.telegram.org/bot";
-  url += BOTtoken;
-  url += "/deleteMessage?chat_id=";
-  url += chatId;
-  url += "&message_id=";
-  url += messageId;
-
-  HTTPClient http;
-  http.begin(client, url); // Usa lo stesso client sicuro del bot
-  int httpCode = http.GET();
-  http.end();
-
-  if (httpCode == 200)
-  {
-    return true;
-  }
-  return false;
 }
 
 String tailLog(int maxLines)
@@ -670,8 +692,8 @@ void telnetSendTail(const char *path, int maxLines)
 
 void leggiSensori(int umidita[2])
 {
-  const int NUM_SAMPLES = 10;           // Numero di campioni per media
-  const int DELAY_BETWEEN_SAMPLES = 10; // 10ms tra letture
+  const int NUM_SAMPLES = 5;           // Numero di campioni per media
+  const int DELAY_BETWEEN_SAMPLES = 5; // 5ms tra letture
 
   long sum1 = 0;
   long sum2 = 0;
@@ -734,18 +756,22 @@ void handleSensore(bool toTelegram)
 void accendiMotori(int who, int tempo)
 {
   const uint32_t now = millis();
+  const bool was1On = (offTimeMot1 != 0);
+  const bool was2On = (offTimeMot2 != 0);
 
   if (who == 1)
   {
     offTimeMot1 = now + (uint32_t)tempo * 1000UL;
-    health.motore1StartTime = now;
+    if (!was1On)
+      health.motore1StartTime = now;
     health.motore1AttivoTroppoTempo = false;
     digitalWrite(Pin_Relay1, LOW);
   }
   else if (who == 2)
   {
     offTimeMot2 = now + (uint32_t)tempo * 1000UL;
-    health.motore2StartTime = now;
+    if (!was2On)
+      health.motore2StartTime = now;
     health.motore2AttivoTroppoTempo = false;
     digitalWrite(Pin_Relay2, LOW);
   }
@@ -753,8 +779,10 @@ void accendiMotori(int who, int tempo)
   {
     offTimeMot1 = now + (uint32_t)tempo * 1000UL;
     offTimeMot2 = now + (uint32_t)tempo * 1000UL;
-    health.motore1StartTime = now;
-    health.motore2StartTime = now;
+    if (!was1On)
+      health.motore1StartTime = now;
+    if (!was2On)
+      health.motore2StartTime = now;
     health.motore1AttivoTroppoTempo = false;
     health.motore2AttivoTroppoTempo = false;
     digitalWrite(Pin_Relay1, LOW);
@@ -811,31 +839,45 @@ void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk)
   if (!autoEnabled)
     return;
   if (!sensoreOk)
-    return; // sensore scollegato -> niente auto
-  if (!irrigazioneConsentita())
-    return; // piove/blocco -> niente auto
+    return;
 
-  // Stato fisico reale del motore (sorgente di verità)
+  // (Opzionale) se vuoi che sia requestIrrigation a dirti IRR_RAIN_BLOCK, rimuovi questo check
+  if (!irrigazioneConsentita())
+    return;
+
+  // Stato fisico reale del motore
   const bool motOn = (m == Motore_1) ? (offTimeMot1 != 0) : (offTimeMot2 != 0);
 
-  // Se qualcuno lo ha spento (manuale/timeout/failsafe), riallineo lo stato AUTO
+  // Se il motore è ON ma AUTO non lo ha “avviato”, consideralo MANUALE e non interferire
+  if (motOn && !az.active)
+    return;
+
+  // Se AUTO credeva di essere attivo ma il motore è stato spento da fuori, riallinea
   if (az.active && !motOn)
   {
     az.active = false;
-    logLine(WARN, "AUTO: motore " + String((int)m) + " spento esternamente (timeout/manuale)", true, true);
+    logLine(WARN, "AUTO: motore " + String((int)m) + " spento esternamente", true, true);
     return;
   }
 
   // START: vaso secco
   if (!az.active && humPct <= az.startTh)
   {
-    az.active = true;
-    accendiMotori((int)m, MAX_MOTOR_SECONDS); // durata massima = safety
-    logLine(INFO, "AUTO START motore " + String((int)m) + " umid=" + String(humPct) + "%", true, true);
+    IrrigationBlockReason rr;
+    uint8_t motB;
+    uint16_t waitM;
+
+    if (!requestIrrigation(m, MAX_MOTOR_SECONDS, "AUTO", rr, motB, waitM))
+    {
+      logLine(WARN, "AUTO BLOCCATA mot=" + String(motB) + " reason=" + String((int)rr), true, true);
+      return;
+    }
+
+    az.active = true; // set solo se è partita davvero
     return;
   }
 
-  // STOP: vaso ok
+  // STOP: vaso ok (solo se AUTO aveva avviato)
   if (az.active && humPct >= az.stopTh)
   {
     az.active = false;
@@ -848,18 +890,60 @@ void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk)
 // Messaggi telegram
 void handleCallBack(String text, String chatId, String messageId)
 {
-  // deleteMessage(chatId, messageId);
+  const uint32_t now = millis();
 
-  // Verifica se operazione motore in corso
-  if (motorOperationInProgress)
+  // delete message
+  enqueueDelete(chatId, (uint32_t)messageId.toInt());
+
+  // 1) Scelta tempo: gestiscila SUBITO e qui avvia davvero l'irrigazione
+  if (text.startsWith("t_"))
   {
-    bot.sendMessage(CHAT_ID, "Attendi... operazione in corso.", "");
+    if (botstate == IDLE)
+    {
+      motorOperationInProgress = false;
+      return;
+    }
+
+    uint16_t seconds = 0;
+    if (text == "t_10")
+      seconds = 10;
+    else if (text == "t_30")
+      seconds = 30;
+    else if (text == "t_60")
+      seconds = 60;
+    else
+    {
+      bot.sendMessage(CHAT_ID, "Tempo non valido.", "");
+      botstate = IDLE;
+      motorOperationInProgress = false;
+      return;
+    }
+
+    IrrigationBlockReason rr;
+    uint8_t motB;
+    uint16_t waitM;
+    const bool ok = requestIrrigation(pendingMotor, seconds, "MANUALE", rr, motB, waitM);
+
+    if (!ok)
+    {
+      if (rr == IRR_TOO_SOON)
+        bot.sendMessage(CHAT_ID, "⏳ Motore " + String(motB) + ": attendi ~" + String(waitM) + " min", "");
+      else if (rr == IRR_DAY_LIMIT)
+        bot.sendMessage(CHAT_ID, "🚫 Motore " + String(motB) + ": limite 10/giorno raggiunto", "");
+      else if (rr == IRR_RAIN_BLOCK)
+        bot.sendMessage(CHAT_ID, "🌧️ Irrigazione bloccata (pioggia/blocco)", "");
+      else
+        bot.sendMessage(CHAT_ID, "Irrigazione bloccata.", "");
+    }
+
+    botstate = IDLE;
+    motorOperationInProgress = false;
+    lastMotorCommandTime = now; // opzionale: evita doppi click subito dopo
     return;
   }
 
-  // Ignora click troppo ravvicinati
-  unsigned long now = millis();
-  if (now - lastMotorCommandTime < MOTOR_DEBOUNCE_INTERVAL)
+  // 2) Debounce SOLO per la scelta motore
+  if ((uint32_t)(now - lastMotorCommandTime) < MOTOR_DEBOUNCE_INTERVAL)
   {
     logLine(WARN, "Click ignorato (debounce)", true, false);
     return;
@@ -868,72 +952,46 @@ void handleCallBack(String text, String chatId, String messageId)
   if (text == "mot1_on")
   {
     if (botstate != IDLE)
-      return; // se sto aspettando un tempo ignora i messaggi del motore
-
+      return;
     motorOperationInProgress = true;
     lastMotorCommandTime = now;
-
     pendingMotor = Motore_1;
     botstate = ASK_TIME_MOT1;
     askTime("motore 1");
+    return;
   }
-  else if (text == "mot2_on")
+
+  if (text == "mot2_on")
   {
     if (botstate != IDLE)
       return;
-
     motorOperationInProgress = true;
     lastMotorCommandTime = now;
-
     pendingMotor = Motore_2;
     botstate = ASK_TIME_MOT2;
     askTime("motore 2");
+    return;
   }
-  else if (text == "mot_all_on")
+
+  if (text == "mot_all_on")
   {
     if (botstate != IDLE)
       return;
-
     motorOperationInProgress = true;
     lastMotorCommandTime = now;
-
     pendingMotor = Entrambi_i_Motori;
     botstate = ASK_TIME_BOTH;
     askTime("entrambi i motori");
-  }
-
-  else if (text.startsWith("t_"))
-  {
-    if (botstate == IDLE)
-    {
-      motorOperationInProgress = false;
-      return;
-    } // se non ho scelto un motore ignora i tempi
-
-    int seconds = 0;
-
-    if (text == "t_10")
-      seconds = 10;
-
-    else if (text == "t_30")
-      seconds = 30;
-
-    else if (text == "t_60")
-      seconds = 60;
-
-    logLine(INFO, "Avvio il motore " + String(pendingMotor) + " per " + String(seconds) + " secondi", true, true);
-
-    accendiMotori((int)pendingMotor, seconds);
-    botstate = IDLE;
-
-    motorOperationInProgress = false;
+    return;
   }
 }
 
 void handleMessage(String text, String chatId, String messageId)
 {
   text.trim(); // togli spazi / \n
-  // deleteMessage(chatId, messageId);
+
+  enqueueDelete(chatId, (uint32_t)messageId.toInt());
+
   if (text == "/meteo")
   {
     handleMeteo();
@@ -1207,7 +1265,7 @@ void handleHealth()
   msg += "\n";
 
   // 🚿 Irrigazioni
-  msg += "🚿 Irrigazioni oggi: " + String(health.irrigazioniOggi) + "\n";
+  msg += "🚿 Irrigazioni oggi: M1=" + String(health.irrigazioniOggiMot1) + " M2=" + String(health.irrigazioniOggiMot2) + "\n";
 
   // ⚠️ AVVISI ATTIVI
   if (health.sensore1Disconnesso)
@@ -1574,6 +1632,213 @@ void checkMotori()
   }
 }
 
+// check irrigazioni
+uint32_t computeDayId()
+{
+  if (!timeReady)
+    return 0;
+  struct tm t;
+  if (!getLocalTime(&t, 50))
+    return 0;
+  return (uint32_t)(t.tm_year + 1900) * 400UL + (uint32_t)t.tm_yday;
+}
+
+void dailyResetTick(uint32_t nowMs)
+{
+  if ((int32_t)(nowMs - g_nextDayCheckMs) < 0)
+    return;
+  g_nextDayCheckMs = nowMs + 60000UL; // 1 volta/minuto
+
+  const uint32_t dayId = computeDayId();
+  if (dayId == 0)
+    return;
+
+  if ((uint32_t)health.lastDayReset != dayId)
+  {
+    health.lastDayReset = (unsigned long)dayId;
+    health.irrigazioniOggiMot1 = 0;
+    health.irrigazioniOggiMot2 = 0;
+    logLine(INFO, "🔄 Reset conteggi irrigazioni giornaliere (per motore)", true, false);
+  }
+}
+
+static inline bool motorIsOn(uint8_t mot)
+{
+  return (mot == 1) ? (offTimeMot1 != 0) : (offTimeMot2 != 0);
+}
+
+static inline uint8_t &todayCountRef(uint8_t mot)
+{
+  return (mot == 1) ? health.irrigazioniOggiMot1 : health.irrigazioniOggiMot2;
+}
+
+static inline unsigned long &lastIrrRef(uint8_t mot)
+{
+  return (mot == 1) ? health.lastIrrMot1 : health.lastIrrMot2;
+}
+
+static bool checkOneMotorGate(uint8_t mot, uint32_t nowMs, IrrigationBlockReason &reason, uint16_t &waitMin)
+{
+  waitMin = 0;
+
+  // limite per-motore al giorno
+  if (todayCountRef(mot) >= MAX_IRRIGATIONS_DAY)
+  {
+    reason = IRR_DAY_LIMIT;
+    return false;
+  }
+
+  // minimo distacco per-motore (overflow-safe con now-last) [web:1][web:28]
+  const unsigned long last = lastIrrRef(mot);
+  if (last != 0 && (uint32_t)(nowMs - (uint32_t)last) < MIN_IRRIGATION_MS)
+  {
+    reason = IRR_TOO_SOON;
+    uint32_t remMs = MIN_IRRIGATION_MS - (uint32_t)(nowMs - (uint32_t)last);
+    waitMin = (uint16_t)(remMs / 60000UL);
+    return false;
+  }
+
+  return true;
+}
+
+bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, IrrigationBlockReason &reason, uint8_t &motBlocked, uint16_t &waitMin)
+{
+  const uint32_t now = millis();
+  dailyResetTick(now);
+
+  reason = IRR_OK;
+  motBlocked = 0;
+  waitMin = 0;
+
+  // Rispetta pioggia/blocco anche in manuale (se vuoi bypass manuale dimmelo)
+  if (!irrigazioneConsentita())
+  {
+    reason = IRR_RAIN_BLOCK;
+    return false;
+  }
+
+  // Quali motori sto davvero avviando ORA? (se già ON non conto e non applico “gap”)
+  const bool start1 = (m == Motore_1 || m == Entrambi_i_Motori) && !motorIsOn(1);
+  const bool start2 = (m == Motore_2 || m == Entrambi_i_Motori) && !motorIsOn(2);
+
+  // Se devo avviarli entrambi, devono passare entrambi i check (altrimenti blocco tutto)
+  if (start1)
+  {
+    if (!checkOneMotorGate(1, now, reason, waitMin))
+    {
+      motBlocked = 1;
+      return false;
+    }
+  }
+  if (start2)
+  {
+    if (!checkOneMotorGate(2, now, reason, waitMin))
+    {
+      motBlocked = 2;
+      return false;
+    }
+  }
+
+  // OK -> accendo
+  accendiMotori((int)m, (int)seconds);
+
+  // Aggiorno contatori solo per i motori realmente partiti da OFF
+  if (start1)
+  {
+    todayCountRef(1)++;
+    lastIrrRef(1) = now;
+  }
+  if (start2)
+  {
+    todayCountRef(2)++;
+    lastIrrRef(2) = now;
+  }
+
+  logLine(INFO, String("🚿 IRR START ") + source + " m=" + String((int)m) + " c1=" + String(health.irrigazioniOggiMot1) + " c2=" + String(health.irrigazioniOggiMot2),
+          true, true);
+
+  return true;
+}
+
+// delete Message
+static bool enqueueDelete(const String &chatId, uint32_t msgId)
+{
+  if (delCount >= (sizeof(delQ) / sizeof(delQ[0])))
+    return false;
+
+  DeleteReq &r = delQ[delTail];
+  memset(&r, 0, sizeof(r));
+  chatId.toCharArray(r.chatId, sizeof(r.chatId)); // evita allocazioni String nella coda
+  r.msgId = msgId;
+  r.retries = 0;
+
+  delTail = (uint8_t)((delTail + 1) % (sizeof(delQ) / sizeof(delQ[0])));
+  delCount++;
+  return true;
+}
+
+static bool deleteNow(const char *chatId, uint32_t msgId)
+{
+  if (WiFi.status() != WL_CONNECTED)
+    return false;
+
+  char url[256];
+  snprintf(url, sizeof(url),
+           "https://api.telegram.org/bot%s/deleteMessage?chat_id=%s&message_id=%u",
+           BOTtoken, chatId, (unsigned)msgId);
+
+  HTTPClient http;
+  http.setTimeout(2500);
+
+  // usa client dedicato, non "client" del bot
+  if (!http.begin(deleteClient, url))
+  {
+    http.end();
+    return false;
+  }
+
+  const int httpCode = http.GET();
+  http.end();
+
+  // Nota: il tuo codice considera 200 come OK, manteniamo stessa logica
+  return (httpCode == 200);
+}
+
+static void processDeleteQueue()
+{
+  if (delCount == 0)
+    return;
+
+  const uint32_t now = millis();
+  if ((int32_t)(now - delNextMs) < 0)
+    return;
+  delNextMs = now + DELETE_MIN_INTERVAL_MS;
+
+  DeleteReq &r = delQ[delHead];
+
+  const bool ok = deleteNow(r.chatId, r.msgId);
+  if (ok)
+  {
+    // pop
+    delHead = (uint8_t)((delHead + 1) % (sizeof(delQ) / sizeof(delQ[0])));
+    delCount--;
+    return;
+  }
+
+  // retry limitato (per non rimanere bloccati)
+  r.retries++;
+  if (r.retries >= 3)
+  {
+    delHead = (uint8_t)((delHead + 1) % (sizeof(delQ) / sizeof(delQ[0])));
+    delCount--;
+  }
+  else
+  {
+    // piccolo backoff extra se fallisce
+    delNextMs = now + (DELETE_MIN_INTERVAL_MS * 2);
+  }
+}
+
 /*
 yield();
 
@@ -1602,8 +1867,6 @@ correggere bug di avvio motori
 check notturno che manda statistiche, qunait warning e error, umidità minima massima e media, irrigazioni totali
 
 sistemare boot con messaggi su telnet
-
-irrigazioni troppo frequenti
 
 implementazione nella ricerca meteo di controllo se piovera nelle prossime 3 ore
 */
