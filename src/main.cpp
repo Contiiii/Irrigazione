@@ -1,4 +1,4 @@
-// Corretta lettura sensori, controllo valori umidita (umidita critica, sensore 1 o 2 disconnesso), aggiunta funzione telegram /health, aggiunto controllo temperatura esp32
+// controllo connessione wifi periodica, controllo connessione a telegram, controllo stato memoria
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -8,6 +8,8 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <SPIFFS.h>
+#include <math.h>
+#include "esp_heap_caps.h"
 
 #include "secrets.h"
 
@@ -94,6 +96,8 @@ struct SystemHealth
 
   // Memoria
   bool memoriaInsufficiente : 1;
+  uint16_t heapFreeKB;
+  uint16_t heapLargestKB;
 
   // Motori
   bool motoreAttivoTroppoTempo : 1;
@@ -126,18 +130,21 @@ const int8_t RSSI_CRITICO = -85;
 const float TEMP_WARNING = 75.0;
 const float TEMP_CRITICAL = 85.0;
 const uint8_t UMIDITA_CRITICA = 15;
-const uint16_t MAX_MOTOR_SECONDS = 600;       // 15 min in secondi
+const uint16_t MAX_MOTOR_SECONDS = 600;       // 10 min in secondi
 const uint32_t MIN_IRRIGATION_MS = 7200000UL; // 2 ore
 const uint8_t MAX_IRRIGATIONS_DAY = 10;
 const uint16_t MIN_FREE_KB = 50;
 const uint16_t SENSOR_LOW = 500;
 const uint16_t SENSOR_HIGH = 4000;
+const uint8_t TELEGRAM_MAX_FAILURES = 5;
 
 // Intervalli check (ottimizzati)
 const uint8_t CHECK_TEMP = 30;
 const uint8_t CHECK_WIFI = 10;
 const uint16_t CHECK_MEMORY = 300;
 const uint8_t CHECK_MOTOR = 5;
+const uint8_t CHECK_TELEGRAM = 60;
+const uint32_t TELEGRAM_TIMEOUT_MS = 10000UL;
 
 // Dati WiFi
 const char *ssid = SECRET_WIFI_SSID;
@@ -219,6 +226,10 @@ void handleMeteo();
 void validazioneSensori(int raw1, int raw2);
 void checkTemperaturaESP32();
 void handleHealth();
+void checkWiFiSignal();
+void checkTelegramConnection();
+int safeGetUpdates();
+void checkMemory();
 
 // ---- FUNZIONI DI DEBUG (Serial + Telnet) ----
 void setup()
@@ -258,9 +269,9 @@ void setup()
   timeReady = getLocalTime(&t, 10000);
 
   // Certificato root per Telegram HTTPS
-  client.setHandshakeTimeout(15);
+  client.setHandshakeTimeout(30);
   client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
-  bot.waitForResponse = 5000;
+  bot.waitForResponse = 10000;
 
   // Messaggio di avvio
   bot.sendMessage(CHAT_ID, "BOT ATTIVO!", "");
@@ -304,11 +315,13 @@ void loop()
 
   // Healt Cheack
   checkTemperaturaESP32();
+  checkWiFiSignal();
+  checkMemory();
 
   // Gestione bot Telegram ogni botRequestDelay ms
   if (now - lastTimeBotRan > (unsigned long)botRequestDelay)
   {
-    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    int numNewMessages = safeGetUpdates();
     lastTimeBotRan = now;
 
     if (numNewMessages > 0)
@@ -369,6 +382,14 @@ void appendLogFile(const String &line)
   if (!spiffsOK)
     return;
 
+  //  Verifica spazio disponibile
+  if (SPIFFS.totalBytes() - SPIFFS.usedBytes() < 10240)
+  { // <10KB
+    SPIFFS.remove("/log.old");
+    SPIFFS.rename("/log.txt", "/log.old");
+    logBytes = 0;
+  }
+
   // Ruota PRIMA di scrivere, basandoti sul contatore in RAM
   if (logBytes + line.length() > MAX_LOG_SIZE)
   {
@@ -395,7 +416,7 @@ void logLine(LogLevel lvl, const String &msg, bool newline = true, bool toTelegr
   const char *L[] = {"I", "D", "W", "E"};
 
   String line;
-  line.reserve(200); // scegli una stima realistica
+  line.reserve(256); // scegli una stima realistica
   line = getTime();
   line += " | ";
   line += L[lvl];
@@ -434,7 +455,7 @@ bool deleteMessage(String chatId, String messageId)
     return false;
 
   String url;
-  url.reserve(220);
+  url.reserve(256);
   url = "https://api.telegram.org/bot";
   url += BOTtoken;
   url += "/deleteMessage?chat_id=";
@@ -473,7 +494,7 @@ String tailLog(int maxLines)
 
   int start = max(0, idx - maxLines);
   String out;
-  out.reserve(2500);
+  out.reserve(2528);
   for (int i = start; i < idx; i++)
     out += lines[i % maxLines] + "\n";
   return out;
@@ -664,7 +685,7 @@ void handleSensore()
   umiditaSens2 = constrain(umiditaSens2, 0, 100);
 
   String msg;
-  msg.reserve(160);
+  msg.reserve(256);
   msg = "umidità: ";
   msg += umiditaSens1;
   msg += "% (";
@@ -821,7 +842,7 @@ void handleCallBack(String text, String chatId, String messageId)
 
     else if (text == "t_60")
       seconds = 60;
-      
+
     logLine(INFO, "Avvio il motore " + String(pendingMotor) + " per " + String(seconds) + " secondi", true, true);
 
     accendiMotori((int)pendingMotor, seconds);
@@ -900,7 +921,7 @@ bool rilevoMeteo()
     return false;
 
   String url;
-  url.reserve(160);
+  url.reserve(256);
   url = "http://api.openweathermap.org/data/2.5/weather?q=";
   url += city;
   url += "&appid=";
@@ -1034,7 +1055,7 @@ void handleMeteo()
   unsigned long etaMin = (millis() - meteo.ultimoAggiornamento) / 60000;
 
   String msg;
-  msg.reserve(300);
+  msg.reserve(384);
   msg += "METEO " + city + "\n";
   msg += "Condizioni: " + meteo.condizioniMeteo + "\n";
   msg += "Temp: " + String(meteo.temperatura, 2) + " °C\n";
@@ -1062,6 +1083,67 @@ void handleMeteo()
 }
 
 // check sistem Health
+void handleHealth()
+{
+  String msg;
+  msg.reserve(512);
+
+  msg = "=== SYSTEM HEALTH ===\n\n";
+
+  // 🌡️ TEMPERATURA ESP32
+  msg += "🌡️ ESP32: ";
+  if (!isfinite(health.temperaturaESP32) || health.temperaturaESP32 == 0.0f)
+  {
+    msg += "--";
+  }
+  else
+  {
+    msg += String(health.temperaturaESP32, 1) + "°C";
+    if (health.temperaturaElevata)
+      msg += " 🔥";
+  }
+  msg += "\n";
+
+  // 📶 WiFi
+  msg += "📶 WiFi: " + String(health.rssi) + " dBm";
+  if (health.wifiDebole)
+    msg += " ⚠️";
+  msg += "\n";
+
+  msg += "💾 HEAP: " + String(health.heapFreeKB) + " KB (largest " + String(health.heapLargestKB) + " KB)\n";
+  msg += "🗄️ SPIFFS: " + String(health.spiffsFreeKB) + " KB liberi\n";
+
+  // 📱 Telegram
+  msg += "📱 Telegram: ";
+  if (health.wifiDisconnesso)
+    msg += "— (WiFi off)";
+  else if (health.telegramIrraggiungibile)
+    msg += "❌ OFFLINE";
+  else
+  {
+    unsigned long ageS = (millis() - health.lastSuccessfulTelegramComm) / 1000UL;
+    msg += "✅ OK (" + String(ageS < 60 ? ageS : (ageS < 3600 ? ageS / 60 : ageS / 3600));
+    msg += (ageS < 60 ? "s" : (ageS < 3600 ? "m" : "h"));
+    msg += ")";
+  }
+  msg += "\n";
+
+  // 🚿 Irrigazioni
+  msg += "🚿 Irrigazioni oggi: " + String(health.irrigazioniOggi) + "\n";
+
+  // ⚠️ AVVISI ATTIVI
+  if (health.sensore1Disconnesso)
+    msg += "\n⚠️ Sensore 1 disconnesso";
+  if (health.sensore2Disconnesso)
+    msg += "\n⚠️ Sensore 2 disconnesso";
+  if (health.umiditaCritica)
+    msg += "\n🚨 Umidità critica";
+  if (health.memoriaInsufficiente)
+    msg += "\n💾 Memoria insufficiente";
+
+  bot.sendMessage(CHAT_ID, msg, ""); // chat_id, text, parse_mode [web:369]
+}
+
 void validazioneSensori(int raw1, int raw2)
 {
   static bool lastSensor1Error = false;
@@ -1172,49 +1254,330 @@ void checkTemperaturaESP32()
   }
 }
 
-void handleHealth() 
+void checkWiFiSignal()
 {
-  String msg;
-  msg.reserve(300);
-  msg = "=== SYSTEM HEALTH ===\n\n";
-  
-  // 🌡️ TEMPERATURA ESP32
-  msg += "ESP32: " + String(health.temperaturaESP32, 1) + "°C";
-  if (health.temperaturaElevata) {
-    msg += " 🔥";  // Icona se temperatura alta
+  static uint32_t lastCheck = 0;
+  uint32_t now = millis();
+
+  if ((now - lastCheck) < (CHECK_WIFI * 1000UL))
+    return; // Non ancora 10 secondi → esci
+
+  lastCheck = now; // Aggiorna timestamp
+
+  // CHECK DISCONNESSIONE WiFi
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    // Prima volta disconnesso? → Logga errore
+    if (!health.wifiDisconnesso)
+    {
+      health.wifiDisconnesso = true;
+      logLine(ERROR_L, "❌ WiFi disconnesso!", true, true);
+    }
+
+    // TENTATIVO RICONNESSIONE AUTOMATICA
+    logLine(WARN, "🔄 Tentativo riconnessione WiFi...", true, false);
+
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(ssid, password);
+
+    // Aspetta max 5 secondi (50 tentativi x 100ms)
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 50)
+    {
+      delay(100);
+      attempts++;
+    }
+
+    // Riconnesso?
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      health.wifiDisconnesso = false;
+      health.rssi = WiFi.RSSI();
+      logLine(INFO, "✅ WiFi riconnesso! IP: " + WiFi.localIP().toString() + " (" + String(health.rssi) + " dBm)", true, true);
+    }
+    else
+    {
+      logLine(ERROR_L, "❌ Riconnessione fallita", true, true);
+    }
+
+    return; // Esci (prossimo check tra 10s)
   }
-  msg += "\n";
-  
-  // 📶 WiFi
-  msg += "WiFi: " + String(health.rssi) + " dBm";
-  if (health.wifiDebole) msg += " ⚠️";
-  msg += "\n";
-  
-  // 💾 Memoria
-  msg += "Memoria: " + String(health.spiffsFreeKB) + " KB\n";
-  
-  // 🚿 Irrigazioni
-  msg += "Irrigazioni oggi: " + String(health.irrigazioniOggi) + "\n";
-  
-  // ⚠️ AVVISI ATTIVI
-  if(health.sensore1Disconnesso) msg += "\n⚠️ Sensore 1 disconnesso";
-  if(health.sensore2Disconnesso) msg += "\n⚠️ Sensore 2 disconnesso";
-  if(health.umiditaCritica) msg += "\n🚨 Umidità critica";
-  if(health.memoriaInsufficiente) msg += "\n💾 Memoria insufficiente";
-  
-  bot.sendMessage(CHAT_ID, msg, "");
+
+  //  WiFi CONNESSO → Resetta flag disconnessione
+  if (health.wifiDisconnesso)
+  {
+    health.wifiDisconnesso = false;
+    logLine(INFO, "✅ WiFi tornato online", true, false);
+  }
+
+  health.rssi = WiFi.RSSI();
+
+  // CHECK SEGNALE DEBOLE (<-75 dBm)
+  if (health.rssi < RSSI_CRITICO)
+  {
+    // Prima volta sotto -85 dBm? → Logga allarme critico
+    if (!health.wifiDebole)
+    {
+      health.wifiDebole = true;
+      logLine(ERROR_L, "🔴 WiFi CRITICO: " + String(health.rssi) + " dBm", true, true);
+    }
+  }
+  else if (health.rssi < RSSI_DEBOLE)
+  {
+    // Prima volta sotto -75 dBm? → Logga avviso
+    if (!health.wifiDebole)
+    {
+      health.wifiDebole = true;
+      logLine(WARN, "⚠️ WiFi debole: " + String(health.rssi) + " dBm", true, false);
+    }
+  }
+  else if (health.rssi > (RSSI_DEBOLE + 5))
+  {
+    // ✅ Segnale OK (>-70 dBm con isteresi 5 dBm)
+    if (health.wifiDebole)
+    {
+      health.wifiDebole = false;
+      logLine(INFO, "✅ WiFi OK: " + String(health.rssi) + " dBm", true, false);
+    }
+  }
+}
+
+/*
+void checkTelegramConnection()
+{
+  static uint32_t lastCheck = 0;
+  uint32_t now = millis();
+
+  if ((now - lastCheck) < (CHECK_TELEGRAM * 1000UL))
+    return;
+
+  lastCheck = now;
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    if (!health.telegramIrraggiungibile)
+    {
+      health.telegramIrraggiungibile = true;
+      logLine(ERROR_L, "❌ Telegram offline (WiFi down)", true, false);
+    }
+    return;
+  }
+
+  static uint8_t failureCount = 0;
+  bool success = false;
+
+  uint16_t originalTimeout = bot.waitForResponse;
+  bot.waitForResponse = 5000;
+
+  uint32_t t0 = millis(); // ✅ timestamp APPENA PRIMA della richiesta
+  String response = bot.sendGetToTelegram("getMe");
+  unsigned long elapsed = millis() - t0; // ✅ tempo REALE della richiesta
+
+  bot.waitForResponse = originalTimeout;
+
+  if (response.length() > 0 && response.indexOf("\"ok\":true") >= 0) // ✅ >= 0, non > 0
+  {
+    success = true;
+    failureCount = 0;
+    health.lastSuccessfulTelegramComm = millis();
+
+    if (health.telegramIrraggiungibile)
+    {
+      health.telegramIrraggiungibile = false;
+      logLine(INFO, "✅ Telegram OK", true, true);
+    }
+  }
+  else
+  {
+    failureCount++;
+    logLine(WARN, "⚠️ Telegram timeout (tentativo " + String(failureCount) + "/" + String(TELEGRAM_MAX_FAILURES) + ")", true, false);
+
+    if (failureCount >= TELEGRAM_MAX_FAILURES)
+    {
+      if (!health.telegramIrraggiungibile)
+      {
+        health.telegramIrraggiungibile = true;
+        logLine(ERROR_L, "❌ Telegram IRRAGGIUNGIBILE (" + String(failureCount) + " fallimenti)", true, true);
+      }
+    }
+  }
+
+  if (debug && success)
+  {
+    logLine(DEBUG_L, "Telegram ping: " + String(elapsed) + " ms", true, false);
+  }
+}
+
+int safeGetUpdates()
+{
+  static uint32_t lastOfflineLog = 0;
+
+  if (WiFi.status() != WL_CONNECTED)
+    return 0;
+
+  if (health.telegramIrraggiungibile)
+  {
+    // log massimo ogni 60s invece che ogni 3s
+    if (millis() - lastOfflineLog > 60000UL)
+    {
+      logLine(WARN, "⚠️ getUpdates saltato (Telegram offline)", true, false);
+      lastOfflineLog = millis();
+    }
+    return 0;
+  }
+
+  int numMessages = bot.getUpdates(bot.last_message_received + 1);
+  if (numMessages >= 0)
+    health.lastSuccessfulTelegramComm = millis();
+  return numMessages;
+}
+
+*/
+
+int safeGetUpdates()
+{
+  // backoff per non bloccare il loop quando TLS/Telegram è instabile
+  static uint32_t nextTryMs = 0;
+  static uint32_t backoffMs = 3000; // 3s -> 6 -> 12 -> ... max 60s
+
+  // log offline rate-limited
+  static uint32_t lastOfflineLog = 0;
+
+  // protezione anti-loop su stesso offset (caso deserializeJson error: last_message_received non avanza) [web:411]
+  static long lastOffsetSeen = -9999;
+  static uint8_t sameOffsetErrs = 0;
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    health.telegramIrraggiungibile = true;
+    return 0;
+  }
+
+  const uint32_t now = millis();
+  if (now < nextTryMs)
+    return 0;
+
+  // workaround ESP32: handshake_timeout può finire a 0 dopo stop/fail; rimettilo prima di ogni tentativo [web:470]
+  client.setHandshakeTimeout(30);
+
+  // tolleranza latenza
+  bot.waitForResponse = (uint16_t)TELEGRAM_TIMEOUT_MS; // nel tuo sketch è 10000UL
+
+  const long offset = bot.last_message_received + 1;
+  int n = bot.getUpdates(offset);
+
+  if (n >= 0)
+  {
+    // OK (anche n==0 = nessun msg)
+    health.telegramIrraggiungibile = false;
+    health.lastSuccessfulTelegramComm = now;
+
+    backoffMs = 3000;
+    nextTryMs = now + (uint32_t)botRequestDelay; // resti coerente col tuo 3000ms
+
+    lastOffsetSeen = bot.last_message_received;
+    sameOffsetErrs = 0;
+    return n;
+  }
+
+  // ERRORE: marca offline ma continua a riprovare con backoff
+  health.telegramIrraggiungibile = true;
+
+  // log massimo 1/min quando offline
+  if (now - lastOfflineLog > 60000UL)
+  {
+    logLine(WARN, "⚠️ Telegram/getUpdates fallito -> backoff " + String(backoffMs) + "ms", true, false);
+    lastOfflineLog = now;
+  }
+
+  // se resti “incollato” allo stesso last_message_received, dopo 3 errori salta 1 update [web:411]
+  if (bot.last_message_received == lastOffsetSeen)
+  {
+    sameOffsetErrs++;
+  }
+  else
+  {
+    lastOffsetSeen = bot.last_message_received;
+    sameOffsetErrs = 1;
+  }
+
+  if (sameOffsetErrs >= 3)
+  {
+    bot.last_message_received++; // perde 1 update “tossico” ma evita loop infinito [web:411]
+    sameOffsetErrs = 0;
+  }
+
+  // backoff (max 60s)
+  backoffMs = min<uint32_t>(backoffMs * 2, 60000UL);
+  nextTryMs = now + backoffMs;
+
+  // chiudi TLS per ripulire stato (utile dopo errori/timeout)
+  client.stop();
+
+  return 0;
+}
+
+void checkMemory()
+{
+  static uint32_t lastCheck = 0;
+  uint32_t now = millis();
+  if ((now - lastCheck) < 300000UL)
+    return; // 300s = CHECK_MEMORY default
+  lastCheck = now;
+
+  // HEAP interno: totale, largest block, minimo storico
+  const size_t freeB = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  const size_t largestB = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  const size_t minEverB = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+
+  // Flag “low heap”
+  const bool low = (freeB < (MIN_FREE_KB * 1024UL));
+  health.memoriaInsufficiente = low;
+
+  // SPIFFS free (flash): total-used
+  if (spiffsOK)
+  {
+    const uint32_t freeFlash = SPIFFS.totalBytes() - SPIFFS.usedBytes();
+    health.spiffsFreeKB = freeFlash / 1024;
+  }
+  else
+  {
+    health.spiffsFreeKB = 0;
+  }
+
+  // Log solo su cambio stato (no spam)
+  static bool lastLow = false;
+  if (low != lastLow)
+  {
+    if (low)
+    {
+      logLine(ERROR_L, "💾 HEAP LOW", true, true);
+    }
+    else
+    {
+      logLine(INFO, "✅ HEAP OK", true, false);
+    }
+    lastLow = low;
+  }
+
+  health.heapFreeKB = freeB / 1024;
+  health.heapLargestKB = largestB / 1024;
+
+  // se debug: log più dettagliato ma senza concatenazioni pesanti
+  if (debug)
+  {
+    char buf[120];
+    snprintf(buf, sizeof(buf),
+             "heapKB=%u largestKB=%u minKB=%u spiffsFreeKB=%u",
+             (unsigned)(freeB / 1024), (unsigned)(largestB / 1024),
+             (unsigned)(minEverB / 1024), (unsigned)health.spiffsFreeKB);
+    logLine(DEBUG_L, String(buf), true, false);
+  }
 }
 
 /*
 yield();
-
-in caso di connessione che salta
-void checkWiFi() {
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.reconnect();
-    delay(5000);
-  }
-}
 
 in caso di mancata risposta dei secondi del motore
 unsigned long stateTimeout = 0;
@@ -1236,23 +1599,17 @@ wifi Sleep mode solo di notte
 
 Utilizzare doppio core
 
-aggiungere emoji per log piu belli
-
 correggere bug di avvio motori
 
 check notturno che manda statistiche, qunait warning e error, umidità minima massima e media, irrigazioni totali
 
-comando per leggere solo  log con  errori o warning
-
 sistemare boot con messaggi su telnet
-
-wifi debole o disconnesso o impossibile connettersi
-
-telegram irraggiungibile o non risponde
 
 spazio memoria piccolo
 
 motore attivo per troppo tempo
 
 irrigazioni troppo frequenti
+
+implementazione nella ricerca meteo di controllo se piovera nelle prossime 3 ore
 */
