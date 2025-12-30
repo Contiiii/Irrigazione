@@ -1,4 +1,4 @@
-// implementato controllo frequenza irrigazione, nuova deleteMessage, implementta funzione che legge warning e error sia su telegram sia completo su telnet
+// fixed spam warning continui di telegram in backoff, fixed spam umidità su log
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -148,13 +148,13 @@ const int8_t RSSI_CRITICO = -85;
 const float TEMP_WARNING = 75.0;
 const float TEMP_CRITICAL = 85.0;
 const uint8_t UMIDITA_CRITICA = 15;
-const uint16_t MAX_MOTOR_SECONDS = 600;    // 10 min in secondi
-const uint32_t MIN_IRRIGATION_MS = 120000; // 1 ore 3600000UL
+const uint16_t MAX_MOTOR_SECONDS = 600;   // 10 min in secondi
+const uint32_t MIN_IRRIGATION_MS = 30000; // 1 ore 3600000UL
 const uint8_t MAX_IRRIGATIONS_DAY = 10;
 const uint16_t MIN_FREE_KB = 50;
 const uint16_t SENSOR_LOW = 500;
 const uint16_t SENSOR_HIGH = 4000;
-const uint8_t TELEGRAM_MAX_FAILURES = 5;
+const uint8_t TEMP_TELEGRAM_DELETE = 10000UL;
 
 // Intervalli check (ottimizzati)
 const uint8_t CHECK_TEMP = 30UL;
@@ -326,7 +326,7 @@ void setup()
   // Certificato root per Telegram HTTPS
   client.setHandshakeTimeout(30);
   client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
-  bot.waitForResponse = 5000;
+  bot.waitForResponse = 3000;
 
   // delete Message
   deleteClient.setHandshakeTimeout(30);
@@ -380,9 +380,6 @@ void loop()
   checkMemory();
   checkMotori();
 
-  // elimina i messaggi
-  processDeleteQueue();
-
   static uint32_t lastAutoSense = 0;
   if (now - lastAutoSense >= CHECK_SENS * 1000UL)
   {
@@ -425,6 +422,14 @@ void loop()
         }
       }
     }
+  }
+
+  // elimina i messaggi
+  static uint32_t lastDelTick = 0;
+  if (now - lastDelTick >= TEMP_TELEGRAM_DELETE)
+  { // ELIMINA MESSAGGI ogni tot secondi
+    lastDelTick = now;
+    processDeleteQueue();
   }
 }
 
@@ -706,11 +711,13 @@ void handleTelnetCommand(const String &cmd)
     if (f)
       f.close();
   }
-  else if (cmd.startsWith("alert")) {
-    bool includeOld = true;          // default: include anche log.old
-    if (cmd.indexOf(" new") >= 0) includeOld = false;
+  else if (cmd.startsWith("alert"))
+  {
+    bool includeOld = true; // default: include anche log.old
+    if (cmd.indexOf(" new") >= 0)
+      includeOld = false;
 
-    telnetPrintAllWarnError(includeOld);   // funzione che ti ho dato prima
+    telnetPrintAllWarnError(includeOld); // funzione che ti ho dato prima
   }
   else
   {
@@ -865,7 +872,31 @@ void handleSensore(bool toTelegram)
   autoTickZone(az1, Motore_1, umiditaSens1, !health.sensore1Disconnesso);
   autoTickZone(az2, Motore_2, umiditaSens2, !health.sensore2Disconnesso);
 
-  logLine(INFO, msg, true, toTelegram);
+  // --- anti-spam log umidità ---
+  static int lastLoggedPct1 = -1;
+  static int lastLoggedPct2 = -1;
+  static uint32_t lastHumLogMs = 0;
+
+  const uint32_t now = millis();
+
+  const uint32_t HUM_LOG_INTERVAL_MS = 10UL * 60UL * 1000UL; // 10 minuti
+  const int HUM_DELTA_PCT = 5;                               // 5%
+
+  int d1 = (lastLoggedPct1 < 0) ? 999 : abs(umiditaSens1 - lastLoggedPct1);
+  int d2 = (lastLoggedPct2 < 0) ? 999 : abs(umiditaSens2 - lastLoggedPct2);
+
+  bool periodic = (now - lastHumLogMs >= HUM_LOG_INTERVAL_MS);
+  bool changed = (d1 >= HUM_DELTA_PCT) || (d2 >= HUM_DELTA_PCT); // "> 5%" come hai scritto
+
+  bool shouldLog = debug || toTelegram || periodic || changed;
+
+  if (shouldLog)
+  {
+    logLine(INFO, msg, true, toTelegram);
+    lastLoggedPct1 = umiditaSens1;
+    lastLoggedPct2 = umiditaSens2;
+    lastHumLogMs = now;
+  }
 }
 
 // motori
@@ -1581,59 +1612,71 @@ int safeGetUpdates()
 {
   static uint32_t nextTryMs = 0;
   static uint32_t backoffMs = 3000;
-  static uint32_t lastOfflineLog = 0;
+
+  static bool wasOffline = false;
+  static uint32_t lastLoggedBackoffMs = 0;
+  static uint32_t lastFailLogMs = 0;
 
   if (WiFi.status() != WL_CONNECTED)
   {
     health.telegramIrraggiungibile = true;
+    wasOffline = true;
     return 0;
   }
 
   const uint32_t now = millis();
+
+  // Ancora in backoff: non loggare (zero spam)
   if ((int32_t)(now - nextTryMs) < 0)
   {
-    // ancora in backoff
-    if (now - lastOfflineLog > 15000UL)
-    {
-      logLine(WARN, "Telegram: in backoff, attendo " + String((nextTryMs - now) / 1000) + "s", true, false);
-      lastOfflineLog = now;
-    }
     return 0;
   }
 
-  // timeout più basso durante polling (evita freeze lunghi)
   uint16_t old = bot.waitForResponse;
-  bot.waitForResponse = 3000; // 3s per getUpdates
+  bot.waitForResponse = 3000;
+  client.setHandshakeTimeout(30);
 
-  client.setHandshakeTimeout(30); // come già fai tu
-  int n = bot.getUpdates(bot.last_message_received + 1);
+  int n = bot.getUpdates(lastHandledUpdateId + 1);
 
   bot.waitForResponse = old;
 
   if (n >= 0)
   {
-    // successo (anche n==0)
     health.telegramIrraggiungibile = false;
     health.lastSuccessfulTelegramComm = now;
+
+    if (wasOffline)
+    {
+      logLine(INFO, "Telegram tornato online", true, false);
+      wasOffline = false;
+    }
+
     backoffMs = 3000;
-    nextTryMs = now + (uint32_t)botRequestDelay; // resta coerente
+    lastLoggedBackoffMs = 0; // reset: così al prossimo errore rilogghe
+    nextTryMs = now + (uint32_t)botRequestDelay;
     return n;
   }
 
-  // errore
+  // Errore
   health.telegramIrraggiungibile = true;
+  wasOffline = true;
 
-  if (now - lastOfflineLog > 15000UL)
+  // Calcola il prossimo backoff
+  uint32_t newBackoff = min<uint32_t>(backoffMs * 2, 15000UL);
+  bool backoffChanged = (newBackoff != lastLoggedBackoffMs);
+
+  // Logga solo se il backoff è cambiato (o se è passato molto tempo)
+  if (backoffChanged || (now - lastFailLogMs > 60000UL))
   {
-    logLine(WARN, "Telegram getUpdates fallito, backoff " + String(backoffMs) + "ms", true, false);
-    lastOfflineLog = now;
+    logLine(WARN, "Telegram getUpdates fallito, backoff " + String(newBackoff) + "ms", true, false);
+    lastFailLogMs = now;
+    lastLoggedBackoffMs = newBackoff;
   }
 
-  // backoff ma limitato
-  backoffMs = min<uint32_t>(backoffMs * 2, 15000UL);
+  backoffMs = newBackoff;
   nextTryMs = now + backoffMs;
 
-  client.stop(); // ripulisce TLS
+  client.stop();
   return 0;
 }
 
@@ -1904,7 +1947,7 @@ static bool deleteNow(const char *chatId, uint32_t msgId)
            BOTtoken, chatId, (unsigned)msgId);
 
   HTTPClient http;
-  http.setTimeout(2500);
+  http.setTimeout(1000);
 
   // usa client dedicato, non "client" del bot
   if (!http.begin(deleteClient, url))
@@ -1922,6 +1965,11 @@ static bool deleteNow(const char *chatId, uint32_t msgId)
 
 static void processDeleteQueue()
 {
+  if (health.telegramIrraggiungibile)
+    return;
+  if (delCount == 0)
+    return;
+
   if (delCount == 0)
     return;
 
@@ -1956,19 +2004,7 @@ static void processDeleteQueue()
 }
 
 /*
-yield();
-
-in caso di mancata risposta dei secondi del motore
-unsigned long stateTimeout = 0;
-if (botstate != IDLE && millis() > stateTimeout) {
-  botstate = IDLE;
-}
-
-POLLING ADATTIVO (di notte alto e quanod messaggio veloce per 5 minuti) (modifica con messaggio telegram, motori accesi, telnet connesso, sensori rilevano irrigazione)
-
 Aggiungere emoji nei log e nei messaggi
-
-Aggiungere lettore di warning o error nei log
 
 crear ciclo di controllo
 
@@ -1976,7 +2012,17 @@ Creare controllo livello acqua
 
 wifi Sleep mode solo di notte
 
+POLLING ADATTIVO (di notte alto e quanod messaggio veloce per 5 minuti) (modifica con messaggio telegram, motori accesi, telnet connesso, sensori rilevano irrigazione)
+
+in caso di mancata risposta dei secondi del motore
+unsigned long stateTimeout = 0;
+if (botstate != IDLE && millis() > stateTimeout) {
+  botstate = IDLE;
+}
+
 Utilizzare doppio core
+
+yield();
 
 correggere bug di avvio motori
 
