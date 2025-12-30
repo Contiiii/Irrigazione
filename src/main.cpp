@@ -1,4 +1,4 @@
-// implementato controllo frequenza irrigazione nuova deleteMessage
+// implementato controllo frequenza irrigazione, nuova deleteMessage, implementta funzione che legge warning e error sia su telegram sia completo su telnet
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -232,6 +232,7 @@ String getTime();
 void appendLogFile(const String &line);
 void logLine(LogLevel lvl, const String &msg, bool newline, bool toTelegram);
 String tailLog(int maxLines);
+String tailWarnError(int maxLines = 50, bool includeOld = false);
 void handleDebug();
 void initLogSize();
 
@@ -239,6 +240,8 @@ void initLogSize();
 void handleTelnet();
 void handleTelnetCommand(const String &cmd);
 void telnetSendTail(const char *path, int maxLines);
+void telnetPrintWarnErrorFile(const char *path);
+void telnetPrintAllWarnError(bool includeOld);
 
 // Prototipi dei sensori
 void leggiSensori(int umidita[2]);
@@ -543,6 +546,71 @@ String tailLog(int maxLines)
   return out;
 }
 
+String tailWarnError(int maxLines, bool includeOld)
+{
+  if (!spiffsOK)
+    return "SPIFFS non disponibile";
+
+  const size_t MAX_OUT = 3500; // limite di caratteri per telegram
+
+  // Ring buffer per le ultime righe matching
+  const int CAP = 120;
+  String ring[CAP];
+  for (int i = 0; i < CAP; i++)
+    ring[i].reserve(128);
+
+  int cap = min(maxLines, CAP);
+  int idx = 0;
+
+  auto scanFile = [&](const char *path)
+  {
+    File f = SPIFFS.open(path, FILE_READ);
+    if (!f)
+      return;
+
+    while (f.available())
+    {
+      String s = f.readStringUntil('\n');
+      s.trim(); // toglie \r e spazi (come fai in telnetSendTail) [file:268]
+
+      // Match sul formato del tuo logLine: " | W | " / " | E | " [file:268]
+      if (s.indexOf(" | W | ") >= 0 || s.indexOf(" | E | ") >= 0)
+      {
+        ring[idx % cap] = s;
+        idx++;
+      }
+    }
+    f.close();
+  };
+
+  // Prima /log.old (opzionale), poi /log.txt così in uscita hai i più recenti
+  if (includeOld)
+    scanFile("/log.old");
+  scanFile("/log.txt");
+
+  if (idx == 0)
+    return "Nessun WARNING/ERROR nel log.";
+
+  int start = max(0, idx - cap);
+
+  String out;
+  out.reserve(MAX_OUT);
+  out = "Ultimi ";
+  out += String(min(idx, cap));
+  out += " WARNING/ERROR:\n\n";
+
+  for (int i = start; i < idx; i++)
+  {
+    const String &line = ring[i % cap];
+    if (out.length() + line.length() + 1 > MAX_OUT)
+      break;
+    out += line;
+    out += "\n";
+  }
+
+  return out;
+}
+
 void handleDebug()
 {
   debug = !debug;
@@ -566,7 +634,7 @@ void handleTelnet()
     if (telnetClient && telnetClient.connected())
       telnetClient.stop();
     telnetClient = telnetServer.available();
-    telnetClient.println("Telnet OK. Comandi: tail, clear, size");
+    telnetClient.println("Telnet OK. Comandi: tail, alert, clear, size");
   }
 
   if (!(telnetClient && telnetClient.connected()))
@@ -638,9 +706,15 @@ void handleTelnetCommand(const String &cmd)
     if (f)
       f.close();
   }
+  else if (cmd.startsWith("alert")) {
+    bool includeOld = true;          // default: include anche log.old
+    if (cmd.indexOf(" new") >= 0) includeOld = false;
+
+    telnetPrintAllWarnError(includeOld);   // funzione che ti ho dato prima
+  }
   else
   {
-    telnetClient.println("Comandi: tail [N], clear, size");
+    telnetClient.println("Comandi: tail, alert, clear, size");
   }
 }
 
@@ -686,6 +760,48 @@ void telnetSendTail(const char *path, int maxLines)
     telnetClient.println(lines[i % maxLines]);
   }
   telnetClient.println("-- EOF (tail) --");
+}
+
+void telnetPrintWarnErrorFile(const char *path)
+{
+  if (!(telnetClient && telnetClient.connected()))
+    return;
+
+  File f = SPIFFS.open(path, FILE_READ);
+  if (!f)
+  {
+    telnetClient.println("No file.");
+    return;
+  }
+
+  char line[512];
+  while (f.available())
+  {
+    size_t n = f.readBytesUntil('\n', line, sizeof(line) - 1);
+    line[n] = '\0';
+
+    // pulizia CR finale (log su file spesso ha \r\n)
+    if (n && line[n - 1] == '\r')
+      line[n - 1] = '\0';
+
+    if (strstr(line, " | W | ") || strstr(line, " | E | "))
+    {
+      telnetClient.println(line);
+    }
+  }
+  f.close();
+}
+
+void telnetPrintAllWarnError(bool includeOld = true)
+{
+  if (!(telnetClient && telnetClient.connected()))
+    return;
+
+  telnetClient.println("\n-- WARN/ERROR --");
+  if (includeOld)
+    telnetPrintWarnErrorFile("/log.old");
+  telnetPrintWarnErrorFile("/log.txt");
+  telnetClient.println("-- EOF --\n");
 }
 
 // sensori
@@ -1010,9 +1126,9 @@ void handleMessage(String text, String chatId, String messageId)
   {
     handleDebug();
   }
-  else if (text == "/manutenzione")
+  else if (text == "/alert")
   {
-    /* handleManutenzione(); */
+    bot.sendMessage(CHAT_ID, tailWarnError(40, true));
   }
   else if (text == "/health")
   {
@@ -1869,4 +1985,7 @@ check notturno che manda statistiche, qunait warning e error, umidità minima ma
 sistemare boot con messaggi su telnet
 
 implementazione nella ricerca meteo di controllo se piovera nelle prossime 3 ore
+
+correggere: Telegram: in backoff, attendo 0s
+
 */
