@@ -1,4 +1,4 @@
-// fixed spam warning continui di telegram in backoff, fixed spam umidità su log
+// rifatto deleteMessage, correzione messaggi di avvio entrambi i motori
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -154,7 +154,6 @@ const uint8_t MAX_IRRIGATIONS_DAY = 10;
 const uint16_t MIN_FREE_KB = 50;
 const uint16_t SENSOR_LOW = 500;
 const uint16_t SENSOR_HIGH = 4000;
-const uint8_t TEMP_TELEGRAM_DELETE = 10000UL;
 
 // Intervalli check (ottimizzati)
 const uint8_t CHECK_TEMP = 30UL;
@@ -167,15 +166,46 @@ const uint8_t CHECK_SENS = 20UL;
 // delete Message
 WiFiClientSecure deleteClient;                       //  Client dedicato SOLO alle delete (non usare lo stesso "client" del bot)
 static const uint32_t DELETE_MIN_INTERVAL_MS = 1200; // allineato al tuo TELEGRAM_MIN_INTERVAL_MS
+
+enum DeleteKind : uint8_t
+{
+  DEL_CALLBACK = 1,
+  DEL_USERMSG = 2,
+  DEL_BOTMSG = 3
+};
+
 struct DeleteReq
 {
   char chatId[24];
   uint32_t msgId;
   uint8_t retries;
+  DeleteKind kind;
+  uint32_t enqMs; // millis() quando lo accodi
+  uint32_t ttlMs; // durata massima di retry per questo messaggio
 };
+
 static DeleteReq delQ[12];
 static uint8_t delHead = 0, delTail = 0, delCount = 0;
 static uint32_t delNextMs = 0;
+
+static const uint32_t TTL_CALLBACK_MS = 30UL * 60UL * 1000UL;      // 30 min per eliminare messaggi di callback
+static const uint32_t TTL_USERMSG_MS = 6UL * 60UL * 60UL * 1000UL; // 6 ore per eliminare messaggi dell'utente
+static const uint32_t TTL_BOTMSG_MS = 2UL * 60UL * 60UL * 1000UL;  // 2 ore per eliminare messaggi del bot temporanei
+
+enum DelResult : uint8_t
+{
+  DEL_OK,
+  DEL_RETRY,
+  DEL_DROP
+};
+
+struct DelOutcome
+{
+  DelResult res;
+  uint32_t retryAfterMs; // 0 se non presente
+  int httpCode;          // per log/debug
+  int apiErrorCode;      // 0 se non presente
+};
 
 // variabili per irrigazione automatica
 struct AutoZone
@@ -218,6 +248,8 @@ long lastHandledUpdateId = 0;
 unsigned long lastMotorCommandTime = 0;
 const unsigned long MOTOR_DEBOUNCE_INTERVAL = 2000; // 2 secondi tra comandi
 bool motorOperationInProgress = false;
+static uint32_t stateTimeoutMs = 0;
+const uint32_t STATE_TIMEOUT_WINDOW_MS = 30000UL; // tempo di timeout per mancata risposta nel accensione motori manualmente
 
 // Variabili motori
 unsigned long offTimeMot1 = 0;
@@ -226,6 +258,39 @@ unsigned long offTimeMot2 = 0;
 // inizializzo varibili per debug e manutenzione
 bool manutenzione = false;
 bool debug = false;
+
+// satistiche giornaliere
+struct DailyStats
+{
+  // log
+  uint16_t warnCount = 0;
+  uint16_t errCount = 0;
+
+  // umidità (sensore 1 e 2)
+  uint16_t humMin1 = 101, humMax1 = 0;
+  uint32_t humSum1 = 0;
+  uint16_t humN1 = 0;
+
+  uint16_t humMin2 = 101, humMax2 = 0;
+  uint32_t humSum2 = 0;
+  uint16_t humN2 = 0;
+
+  // irrigazioni
+  uint16_t irrCount1 = 0, irrCount2 = 0;
+  uint32_t irrSec1 = 0, irrSec2 = 0;
+
+  // blocchi irrigazione
+  uint16_t blockRain = 0, blockTooSoon = 0, blockDayLimit = 0;
+
+  // scheduler
+  uint32_t lastReportDayId = 0;
+};
+
+static DailyStats stats;
+
+static const uint8_t NIGHT_REPORT_HOUR = 3; // orario per generare il report
+static const uint8_t NIGHT_REPORT_MIN_FROM = 0;
+static const uint8_t NIGHT_REPORT_MIN_TO = 60; // intervallo di 1 ora per generarlo
 
 // Prototipi di log
 String getTime();
@@ -252,6 +317,10 @@ void accendiMotori(int who, int tempo);
 void spegniMotori(int who);
 void askTime(const String &who);
 void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk);
+static inline void armStateTimeout(uint32_t windowMs);
+static inline bool isStateTimeoutExpired();
+static inline void resetAskSession();
+static inline String motorLabel(uint8_t m);
 
 // Prototipi per messaggi telegram
 void handleCallBack(String text, String chatId, String messageId);
@@ -283,16 +352,26 @@ void dailyResetTick(uint32_t nowMs);
 bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, IrrigationBlockReason &reason, uint8_t &motBlocked, uint16_t &waitMin);
 
 // delete Message
-static bool enqueueDelete(const String &chatId, uint32_t msgId);
-static bool deleteNow(const char *chatId, uint32_t msgId);
+static bool enqueueDelete(const String &chatId, uint32_t msgId, DeleteKind kind);
+static DelOutcome deleteNow(const char *chatId, uint32_t msgId);
 static void processDeleteQueue();
+static inline void popDeleteHead();
+
+// funzione Helper per log
+static inline String boolToEmoji(bool v, bool inverted = false);
+static inline String umiditaStatusEmoji(int um);
+
+// statistiche giornaliere
+void nightlyReportTick(uint32_t nowMs);
+static void sendNightlyReport();
+static void resetDailyStats();
 
 void setup()
 {
   Serial.begin(115200);
   delay(200);
 
-  // logLine(DEBUG_L, "Boot ESP32...", true, false);
+  // logLine(DEBUG_L, "🚀 Boot ESP32...", true, false);
 
   pinMode(Pin_SensoreContenitore, INPUT_PULLUP);
   pinMode(Pin_Sensore1, INPUT);
@@ -305,9 +384,13 @@ void setup()
   digitalWrite(Pin_Relay2, HIGH);
 
   // Avvio wifi
-  logLine(DEBUG_L, String("Connessione a ") + ssid, true, false);
+  logLine(DEBUG_L, String("📡 Connessione a ") + ssid, true, false);
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED)
   {
@@ -317,20 +400,22 @@ void setup()
   logLine(DEBUG_L, String("Connesso! IP: ") + WiFi.localIP().toString(), true, false);
 
   // dopo che il WiFi è connesso
-  logLine(DEBUG_L, "Imposto orario NTP...", true, false);
+  logLine(DEBUG_L, "🕐 Imposto orario NTP...", true, false);
   configTime(3600, 3600, "pool.ntp.org", "time.nist.gov");
 
   struct tm t;
   timeReady = getLocalTime(&t, 10000);
 
   // Certificato root per Telegram HTTPS
-  client.setHandshakeTimeout(30);
+  client.setHandshakeTimeout(7);
   client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+  client.setTimeout(2000);
   bot.waitForResponse = 3000;
 
   // delete Message
-  deleteClient.setHandshakeTimeout(30);
+  deleteClient.setHandshakeTimeout(7);
   deleteClient.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+  deleteClient.setTimeout(2000);
 
   // Messaggio di avvio
   bot.sendMessage(CHAT_ID, "BOT ATTIVO!", "");
@@ -348,9 +433,9 @@ void setup()
   spiffsOK = SPIFFS.begin(true); // true = formatta se non montabile [web:61]
   if (spiffsOK)
     initLogSize();
-  logLine(INFO, String("SPIFFS: ") + (spiffsOK ? "OK" : "FAIL"), true, false);
+  logLine(INFO, String("💾 SPIFFS: ") + boolToEmoji(spiffsOK), true, false);
 
-  logLine(DEBUG_L, "ArduinoOTA pronto", true, false);
+  logLine(DEBUG_L, "🔌 OTA pronto", true, false);
 }
 
 void loop()
@@ -359,6 +444,16 @@ void loop()
   unsigned long now = millis();
 
   dailyResetTick(millis());
+
+  // report notturno
+  nightlyReportTick(now);
+
+  // TIMEOUT risposta accensione motori manuale
+  if (botstate != IDLE && isStateTimeoutExpired())
+  {
+    resetAskSession();
+    bot.sendMessage(CHAT_ID, "Richiesta scaduta, riprova.", "");
+  }
 
   // Gestione nuove connessioni Telnet
   handleTelnet();
@@ -412,7 +507,7 @@ void loop()
 
         if (type == "message")
         {
-          logLine(DEBUG_L, String("messaggio ") + text, true, false);
+          logLine(DEBUG_L, String("Messaggio:") + text, true, false);
           handleMessage(text, chatId, messageId);
         }
         else if (type == "callback_query")
@@ -425,12 +520,7 @@ void loop()
   }
 
   // elimina i messaggi
-  static uint32_t lastDelTick = 0;
-  if (now - lastDelTick >= TEMP_TELEGRAM_DELETE)
-  { // ELIMINA MESSAGGI ogni tot secondi
-    lastDelTick = now;
-    processDeleteQueue();
-  }
+  processDeleteQueue();
 }
 
 // Funzioni di log
@@ -498,6 +588,7 @@ void logLine(LogLevel lvl, const String &msg, bool newline = true, bool toTelegr
   line += " | ";
   line += L[lvl];
   line += " | ";
+  line += " ";
   line += msg;
 
   // Log file
@@ -513,6 +604,12 @@ void logLine(LogLevel lvl, const String &msg, bool newline = true, bool toTelegr
     if (newline)
       telnetClient.print("\r\n"); // <-- QUESTO sistema la “scaletta” [web:187]
   }
+
+  // statistiche giornaliere
+  if (lvl == WARN)
+    stats.warnCount++;
+  if (lvl == ERROR_L)
+    stats.errCount++;
 
   // Telegram
 
@@ -619,7 +716,7 @@ String tailWarnError(int maxLines, bool includeOld)
 void handleDebug()
 {
   debug = !debug;
-  logLine(INFO, debug ? "DEBUG ATTIVO" : "DEBUG DISATTIVO", true, false);
+  logLine(INFO, debug ? "🔧 DEBUG ATTIVO" : "🔧 DEBUG DISATTIVO", true, true);
 }
 
 void initLogSize()
@@ -812,7 +909,6 @@ void telnetPrintAllWarnError(bool includeOld = true)
 }
 
 // sensori
-
 void leggiSensori(int umidita[2])
 {
   const int NUM_SAMPLES = 5;           // Numero di campioni per media
@@ -851,23 +947,46 @@ void handleSensore(bool toTelegram)
   umiditaSens2 = constrain(umiditaSens2, 0, 100);
 
   String msg;
-  msg.reserve(256);
-  msg = "umidità: ";
-  msg += umiditaSens1;
-  msg += "% (";
-  msg += umidita[0];
-  msg += "), ";
-  msg += umiditaSens2;
-  msg += "% (";
-  msg += umidita[1];
-  msg += ")";
+  String p1 = health.sensore1Disconnesso ? "💧 Pianta 1: N/D (sensore off)" : "💧 Pianta 1: " + String(umiditaSens1) + "% " + umiditaStatusEmoji(umiditaSens1) + " (" + String(umidita[0]) + ")";
+
+  String p2 = health.sensore2Disconnesso ? "💧 Pianta 2: N/D (sensore off)" : "💧 Pianta 2: " + String(umiditaSens2) + "% " + umiditaStatusEmoji(umiditaSens2) + " (" + String(umidita[1]) + ")";
+
+  msg = "🌱 SENSORI\n" + p1 + "\n" + p2;
 
   if (health.sensore1Disconnesso)
-    msg += " ⚠️S1"; // Sensore 1 scollegato
+    msg += "\n⚠️ Sensore 1 disconnesso";
   if (health.sensore2Disconnesso)
-    msg += " ⚠️S2"; // Sensore 2 scollegato
+    msg += "\n⚠️ Sensore 2 disconnesso";
   if (health.umiditaCritica)
-    msg += " 🚨CRITICA";
+    msg += "\n🚨 Umidità critica";
+
+  if (!health.sensore1Disconnesso)
+  {
+    // minima
+    if (umiditaSens1 < stats.humMin1)
+      stats.humMin1 = umiditaSens1;
+    // massima
+    if (umiditaSens1 > stats.humMax1)
+      stats.humMax1 = umiditaSens1;
+    // somma
+    stats.humSum1 += umiditaSens1;
+    // totali
+    stats.humN1 += 1;
+  }
+
+  if (!health.sensore2Disconnesso)
+  {
+    // minima
+    if (umiditaSens2 < stats.humMin2)
+      stats.humMin2 = umiditaSens2;
+    // massima
+    if (umiditaSens2 > stats.humMax2)
+      stats.humMax2 = umiditaSens2;
+    // somma
+    stats.humSum2 += umiditaSens2;
+    // totali
+    stats.humN2 += 1;
+  }
 
   autoTickZone(az1, Motore_1, umiditaSens1, !health.sensore1Disconnesso);
   autoTickZone(az2, Motore_2, umiditaSens2, !health.sensore2Disconnesso);
@@ -1003,20 +1122,20 @@ void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk)
   if (az.active && !motOn)
   {
     az.active = false;
-    logLine(WARN, "AUTO: motore " + String((int)m) + " spento esternamente", true, true);
+    logLine(WARN, "AUTO: motore " + motorLabel((int)m) + " spento esternamente", true, true);
     return;
   }
 
   // START: vaso secco
   if (!az.active && humPct <= az.startTh)
   {
-    IrrigationBlockReason rr;
-    uint8_t motB;
-    uint16_t waitM;
+    uint8_t motB = 0;
+    uint16_t waitM = 0;
+    IrrigationBlockReason rr = IRR_OK;
 
     if (!requestIrrigation(m, MAX_MOTOR_SECONDS, "AUTO", rr, motB, waitM))
     {
-      logLine(WARN, "AUTO BLOCCATA mot=" + String(motB) + " reason=" + String((int)rr), true, true);
+      logLine(WARN, "⛔ AUTO BLOCCATA mot=" + motorLabel(m) + " reason=" + String((int)rr), true, true);
       return;
     }
 
@@ -1029,9 +1148,37 @@ void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk)
   {
     az.active = false;
     spegniMotori((int)m);
-    logLine(INFO, "AUTO STOP motore " + String((int)m) + " umid=" + String(humPct) + "%", true, true);
+    logLine(INFO, "⏸️ AUTO STOP motore " + motorLabel(m) + " umid=" + String(humPct) + "%", true, true);
     return;
   }
+}
+
+static inline void armStateTimeout(uint32_t windowMs)
+{
+  stateTimeoutMs = millis() + windowMs;
+}
+
+static inline bool isStateTimeoutExpired()
+{
+  return stateTimeoutMs != 0 && (int32_t)(millis() - stateTimeoutMs) >= 0; // overflow-safe
+}
+
+static inline void resetAskSession()
+{
+  botstate = IDLE;
+  motorOperationInProgress = false;
+  stateTimeoutMs = 0;
+}
+
+static inline String motorLabel(uint8_t m)
+{
+  if (m == 1)
+    return "1";
+  if (m == 2)
+    return "2";
+  if (m == 3)
+    return "1+2"; // oppure "Entrambi"
+  return "?";
 }
 
 // Messaggi telegram
@@ -1040,14 +1187,14 @@ void handleCallBack(String text, String chatId, String messageId)
   const uint32_t now = millis();
 
   // delete message
-  enqueueDelete(chatId, (uint32_t)messageId.toInt());
+  enqueueDelete(chatId, (uint32_t)messageId.toInt(), DEL_CALLBACK);
 
   // 1) Scelta tempo: gestiscila SUBITO e qui avvia davvero l'irrigazione
   if (text.startsWith("t_"))
   {
-    if (botstate == IDLE)
+    if (botstate == IDLE || isStateTimeoutExpired())
     {
-      motorOperationInProgress = false;
+      resetAskSession();
       return;
     }
 
@@ -1061,38 +1208,44 @@ void handleCallBack(String text, String chatId, String messageId)
     else
     {
       bot.sendMessage(CHAT_ID, "Tempo non valido.", "");
+      resetAskSession();
       botstate = IDLE;
       motorOperationInProgress = false;
       return;
     }
 
-    IrrigationBlockReason rr;
-    uint8_t motB;
-    uint16_t waitM;
+    uint8_t motB = 0;
+    uint16_t waitM = 0;
+    IrrigationBlockReason rr = IRR_OK;
+
     const bool ok = requestIrrigation(pendingMotor, seconds, "MANUALE", rr, motB, waitM);
 
     if (!ok)
     {
       if (rr == IRR_TOO_SOON)
-        bot.sendMessage(CHAT_ID, "⏳ Motore " + String(motB) + ": attendi ~" + String(waitM) + " min", "");
+        bot.sendMessage(CHAT_ID, "⏳ Motore " + motorLabel(motB) + ": attendi ~" + String(waitM) + " min", "");
       else if (rr == IRR_DAY_LIMIT)
-        bot.sendMessage(CHAT_ID, "🚫 Motore " + String(motB) + ": limite 10/giorno raggiunto", "");
+        bot.sendMessage(CHAT_ID, "🚫 Motore " + motorLabel(motB) + ": limite 10/giorno raggiunto", "");
       else if (rr == IRR_RAIN_BLOCK)
         bot.sendMessage(CHAT_ID, "🌧️ Irrigazione bloccata (pioggia/blocco)", "");
       else
         bot.sendMessage(CHAT_ID, "Irrigazione bloccata.", "");
+
+      resetAskSession();
+      return;
     }
 
     botstate = IDLE;
     motorOperationInProgress = false;
     lastMotorCommandTime = now; // opzionale: evita doppi click subito dopo
+    resetAskSession();
     return;
   }
 
   // 2) Debounce SOLO per la scelta motore
   if ((uint32_t)(now - lastMotorCommandTime) < MOTOR_DEBOUNCE_INTERVAL)
   {
-    logLine(WARN, "Click ignorato (debounce)", true, false);
+    logLine(WARN, "⏱️ Click ignorato (debounce)", true, false);
     return;
   }
 
@@ -1105,6 +1258,8 @@ void handleCallBack(String text, String chatId, String messageId)
     pendingMotor = Motore_1;
     botstate = ASK_TIME_MOT1;
     askTime("motore 1");
+
+    armStateTimeout(STATE_TIMEOUT_WINDOW_MS);
     return;
   }
 
@@ -1117,6 +1272,8 @@ void handleCallBack(String text, String chatId, String messageId)
     pendingMotor = Motore_2;
     botstate = ASK_TIME_MOT2;
     askTime("motore 2");
+
+    armStateTimeout(STATE_TIMEOUT_WINDOW_MS);
     return;
   }
 
@@ -1129,6 +1286,8 @@ void handleCallBack(String text, String chatId, String messageId)
     pendingMotor = Entrambi_i_Motori;
     botstate = ASK_TIME_BOTH;
     askTime("entrambi i motori");
+
+    armStateTimeout(STATE_TIMEOUT_WINDOW_MS);
     return;
   }
 }
@@ -1137,7 +1296,7 @@ void handleMessage(String text, String chatId, String messageId)
 {
   text.trim(); // togli spazi / \n
 
-  enqueueDelete(chatId, (uint32_t)messageId.toInt());
+  enqueueDelete(chatId, (uint32_t)messageId.toInt(), DEL_USERMSG);
 
   if (text == "/meteo")
   {
@@ -1219,7 +1378,7 @@ bool rilevoMeteo()
   if (httpCode != 200)
   {
     http.end();
-    logLine(ERROR_L, "Errore HTTP: " + String(httpCode), true, false);
+    logLine(ERROR_L, "☁️❌ Errore HTTP: " + String(httpCode), true, false);
     return false;
   }
 
@@ -1228,7 +1387,7 @@ bool rilevoMeteo()
   if (!stream)
   {
     http.end();
-    logLine(ERROR_L, "Stream non disponibile", true, false);
+    logLine(ERROR_L, "☁️❌ Stream non disponibile", true, false);
     return false;
   }
 
@@ -1247,7 +1406,7 @@ bool rilevoMeteo()
 
   if (error)
   {
-    logLine(ERROR_L, "Errore JSON: " + String(error.c_str()), true, false);
+    logLine(ERROR_L, "🧩❌ Errore JSON: " + String(error.c_str()), true, false);
     return false;
   }
 
@@ -1303,14 +1462,12 @@ void attivoBloccoPioggia()
 
 void controlloBloccoPioggia()
 {
-  if (bloccoIrrigazione)
+  if (!bloccoIrrigazione)
+    return;
+  if ((uint32_t)(millis() - scadenzaBloccoIrrigazione) >= 0)
   {
-    unsigned long elapsed = millis() - (scadenzaBloccoIrrigazione - DurataBloccoPioggia);
-    if (elapsed >= DurataBloccoPioggia)
-    {
-      bloccoIrrigazione = false;
-      scadenzaBloccoIrrigazione = 0;
-    }
+    bloccoIrrigazione = false;
+    scadenzaBloccoIrrigazione = 0;
   }
 }
 
@@ -1331,7 +1488,7 @@ void handleMeteo()
 
   if (!meteo.datiValidi)
   {
-    logLine(ERROR_L, "Meteo non disponibile", true, true);
+    logLine(ERROR_L, "☁️❌ Meteo non disponibile", true, true);
     return;
   }
 
@@ -1348,17 +1505,16 @@ void handleMeteo()
 
   if (bloccoIrrigazione)
   {
-    unsigned long elapsed = millis() - (scadenzaBloccoIrrigazione - DurataBloccoPioggia);
-
-    if (elapsed < DurataBloccoPioggia)
+    uint32_t elapsed = (uint32_t)(millis() - scadenzaBloccoIrrigazione);
+    if (elapsed < 0)
     {
-      unsigned long remaining = DurataBloccoPioggia - elapsed;
-      unsigned long remMin = remaining / 60000;
-      msg += "Blocco irrigazione: " + String(remMin) + " min\n";
+      uint32_t remaining = scadenzaBloccoIrrigazione - millis();
+      uint32_t remMin = remaining / 60000UL;
+      msg += "\n⛔ Blocco irrigazione: " + String(remMin) + " min";
     }
     else
     {
-      msg += "Blocco irrigazione: scaduto\n";
+      msg += "\n✅ Blocco irrigazione scaduto";
     }
   }
 
@@ -1416,11 +1572,11 @@ void handleHealth()
 
   // ⚠️ AVVISI ATTIVI
   if (health.sensore1Disconnesso)
-    msg += "\n⚠️ Sensore 1 disconnesso";
+    msg += "\n❌🌱 Sensore 1 disconnesso";
   if (health.sensore2Disconnesso)
-    msg += "\n⚠️ Sensore 2 disconnesso";
+    msg += "\n❌🌱 Sensore 2 disconnesso";
   if (health.umiditaCritica)
-    msg += "\n🚨 Umidità critica";
+    msg += "\n🚨🌵 Umidità critica";
   if (health.memoriaInsufficiente)
     msg += "\n💾 Memoria insufficiente";
 
@@ -1516,7 +1672,7 @@ void checkTemperaturaESP32()
     if (!health.temperaturaElevata)
     {
       health.temperaturaElevata = true;
-      logLine(WARN, "⚠️ Temp ESP32 elevata: " + String(health.temperaturaESP32, 1) + "°C", true, false);
+      logLine(WARN, "🌡️⚠️ Temp ESP32 elevata: " + String(health.temperaturaESP32, 1) + "°C", true, false);
     }
   }
   else if (health.temperaturaESP32 < (TEMP_WARNING - 5.0))
@@ -1525,7 +1681,7 @@ void checkTemperaturaESP32()
     if (health.temperaturaElevata)
     {
       health.temperaturaElevata = false;
-      logLine(INFO, "✅ Temp ESP32 OK: " + String(health.temperaturaESP32, 1) + "°C", true, false);
+      logLine(INFO, "🌡️✅ Temp ESP32 OK: " + String(health.temperaturaESP32, 1) + "°C", true, false);
 
       // Ripristina CPU a velocità normale se era stata ridotta
       if (getCpuFrequencyMhz() < 240)
@@ -1552,10 +1708,10 @@ void checkWiFiSignal()
     if (!health.wifiDisconnesso)
     {
       health.wifiDisconnesso = true;
-      logLine(ERROR_L, "❌ WiFi disconnesso!", true, true);
+      logLine(ERROR_L, "📡❌ WiFi disconnesso!", true, true);
     }
 
-    logLine(WARN, "🔄 Tentativo riconnessione WiFi (non bloccante)...", true, false);
+    logLine(WARN, "🔄📡 Tentativo riconnessione WiFi (non bloccante)...", true, false);
 
     WiFi.disconnect();
     delay(10);
@@ -1565,7 +1721,7 @@ void checkWiFiSignal()
     WiFi.begin(ssid, password); // avvia reconnessione, ma NON aspettare qui
 
     // Se vuoi: dopo begin, prova a leggere status e loggare “in corso”
-    logLine(WARN, "⏳ WiFi: reconnessione avviata, riprovo al prossimo check", true, false);
+    logLine(WARN, "📡⏳ WiFi: reconnessione avviata, riprovo al prossimo check", true, false);
     return;
   }
 
@@ -1574,7 +1730,7 @@ void checkWiFiSignal()
   {
     health.wifiDisconnesso = false;
     health.rssi = WiFi.RSSI();
-    logLine(INFO, "✅ WiFi tornato online. IP: " + WiFi.localIP().toString() + " (" + String(health.rssi) + " dBm)", true, true);
+    logLine(INFO, "📡✅ WiFi tornato online. IP: " + WiFi.localIP().toString() + " (" + String(health.rssi) + " dBm)", true, true);
   }
   else
   {
@@ -1587,7 +1743,7 @@ void checkWiFiSignal()
     if (!health.wifiDebole)
     {
       health.wifiDebole = true;
-      logLine(ERROR_L, "🔴 WiFi CRITICO: " + String(health.rssi) + " dBm", true, true);
+      logLine(ERROR_L, "📶🚨 WiFi CRITICO: " + String(health.rssi) + " dBm", true, true);
     }
   }
   else if (health.rssi < RSSI_DEBOLE)
@@ -1595,7 +1751,7 @@ void checkWiFiSignal()
     if (!health.wifiDebole)
     {
       health.wifiDebole = true;
-      logLine(WARN, "⚠️ WiFi debole: " + String(health.rssi) + " dBm", true, false);
+      logLine(WARN, "📶⚠️ WiFi debole: " + String(health.rssi) + " dBm", true, false);
     }
   }
   else if (health.rssi > (RSSI_DEBOLE + 5))
@@ -1603,7 +1759,7 @@ void checkWiFiSignal()
     if (health.wifiDebole)
     {
       health.wifiDebole = false;
-      logLine(INFO, "✅ WiFi OK: " + String(health.rssi) + " dBm", true, false);
+      logLine(INFO, "📶✅ WiFi OK: " + String(health.rssi) + " dBm", true, false);
     }
   }
 }
@@ -1647,7 +1803,7 @@ int safeGetUpdates()
 
     if (wasOffline)
     {
-      logLine(INFO, "Telegram tornato online", true, false);
+      logLine(INFO, "✅🤖 Telegram tornato online", true, false);
       wasOffline = false;
     }
 
@@ -1662,13 +1818,16 @@ int safeGetUpdates()
   wasOffline = true;
 
   // Calcola il prossimo backoff
-  uint32_t newBackoff = min<uint32_t>(backoffMs * 2, 15000UL);
+  uint32_t newBackoff = backoffMs * 2;
+  if (newBackoff > 15000UL)
+    newBackoff = 15000UL;
+
   bool backoffChanged = (newBackoff != lastLoggedBackoffMs);
 
   // Logga solo se il backoff è cambiato (o se è passato molto tempo)
   if (backoffChanged || (now - lastFailLogMs > 60000UL))
   {
-    logLine(WARN, "Telegram getUpdates fallito, backoff " + String(newBackoff) + "ms", true, false);
+    logLine(WARN, "⚠️🤖 Telegram getUpdates fallito, backoff " + String(newBackoff) + "ms", true, false);
     lastFailLogMs = now;
     lastLoggedBackoffMs = newBackoff;
   }
@@ -1714,11 +1873,11 @@ void checkMemory()
   {
     if (low)
     {
-      logLine(ERROR_L, "💾 HEAP LOW", true, true);
+      logLine(ERROR_L, "💾🚨 HEAP LOW", true, true);
     }
     else
     {
-      logLine(INFO, "✅ HEAP OK", true, false);
+      logLine(INFO, "💾✅ HEAP OK", true, false);
     }
     lastLow = low;
   }
@@ -1817,7 +1976,7 @@ void dailyResetTick(uint32_t nowMs)
     health.lastDayReset = (unsigned long)dayId;
     health.irrigazioniOggiMot1 = 0;
     health.irrigazioniOggiMot2 = 0;
-    logLine(INFO, "🔄 Reset conteggi irrigazioni giornaliere (per motore)", true, false);
+    logLine(INFO, "🔄🚿 Reset conteggi irrigazioni giornaliere (per motore)", true, false);
   }
 }
 
@@ -1873,6 +2032,7 @@ bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, Irrigat
   if (!irrigazioneConsentita())
   {
     reason = IRR_RAIN_BLOCK;
+    stats.blockRain++;
     return false;
   }
 
@@ -1886,6 +2046,10 @@ bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, Irrigat
     if (!checkOneMotorGate(1, now, reason, waitMin))
     {
       motBlocked = 1;
+      if (reason == IRR_TOO_SOON)
+        stats.blockTooSoon++;
+      else if (reason == IRR_DAY_LIMIT)
+        stats.blockDayLimit++;
       return false;
     }
   }
@@ -1894,6 +2058,10 @@ bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, Irrigat
     if (!checkOneMotorGate(2, now, reason, waitMin))
     {
       motBlocked = 2;
+      if (reason == IRR_TOO_SOON)
+        stats.blockTooSoon++;
+      else if (reason == IRR_DAY_LIMIT)
+        stats.blockDayLimit++;
       return false;
     }
   }
@@ -1913,33 +2081,49 @@ bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, Irrigat
     lastIrrRef(2) = now;
   }
 
-  logLine(INFO, String("🚿 IRR START ") + source + " m=" + String((int)m) + " c1=" + String(health.irrigazioniOggiMot1) + " c2=" + String(health.irrigazioniOggiMot2),
+  // contatori per report notturno
+  if (start1)
+  {
+    stats.irrCount1++;
+    stats.irrSec1 += (uint32_t)seconds;
+  }
+  if (start2)
+  {
+    stats.irrCount2++;
+    stats.irrSec2 += (uint32_t)seconds;
+  }
+
+  logLine(INFO, String("🚿▶️ IRR START ") + source + " m=" + motorLabel((int)m) + " c1=" + String(health.irrigazioniOggiMot1) + " c2=" + String(health.irrigazioniOggiMot2),
           true, true);
 
   return true;
 }
 
 // delete Message
-static bool enqueueDelete(const String &chatId, uint32_t msgId)
+static bool enqueueDelete(const String &chatId, uint32_t msgId, DeleteKind kind)
 {
   if (delCount >= (sizeof(delQ) / sizeof(delQ[0])))
     return false;
-
   DeleteReq &r = delQ[delTail];
   memset(&r, 0, sizeof(r));
-  chatId.toCharArray(r.chatId, sizeof(r.chatId)); // evita allocazioni String nella coda
+  chatId.toCharArray(r.chatId, sizeof(r.chatId));
   r.msgId = msgId;
   r.retries = 0;
-
+  r.kind = kind;
+  r.enqMs = millis();
+  r.ttlMs = (kind == DEL_CALLBACK) ? TTL_CALLBACK_MS : (kind == DEL_USERMSG) ? TTL_USERMSG_MS
+                                                                             : TTL_BOTMSG_MS;
   delTail = (uint8_t)((delTail + 1) % (sizeof(delQ) / sizeof(delQ[0])));
   delCount++;
   return true;
 }
 
-static bool deleteNow(const char *chatId, uint32_t msgId)
+static DelOutcome deleteNow(const char *chatId, uint32_t msgId)
 {
+  DelOutcome out{DEL_RETRY, 0, 0, 0};
+
   if (WiFi.status() != WL_CONNECTED)
-    return false;
+    return out;
 
   char url[256];
   snprintf(url, sizeof(url),
@@ -1947,84 +2131,273 @@ static bool deleteNow(const char *chatId, uint32_t msgId)
            BOTtoken, chatId, (unsigned)msgId);
 
   HTTPClient http;
-  http.setTimeout(1000);
-
-  // usa client dedicato, non "client" del bot
+  http.setTimeout(3000); // un po' più alto del tuo 1000ms
   if (!http.begin(deleteClient, url))
   {
     http.end();
-    return false;
+    return out;
   }
 
   const int httpCode = http.GET();
+  out.httpCode = httpCode;
+
+  String body;
+  if (httpCode > 0)
+    body = http.getString();
   http.end();
 
-  // Nota: il tuo codice considera 200 come OK, manteniamo stessa logica
-  return (httpCode == 200);
+  // Errori di rete/SSL: ritenta
+  if (httpCode <= 0)
+  {
+    out.res = DEL_RETRY;
+    return out;
+  }
+
+  // Prova a capire l'esito applicativo dal JSON
+  StaticJsonDocument<384> doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err)
+  {
+    out.res = (httpCode == 200) ? DEL_OK : DEL_RETRY; // fallback prudente
+    return out;
+  }
+
+  const bool ok = doc["ok"] | false;
+  if (ok)
+  {
+    out.res = DEL_OK;
+    return out;
+  }
+
+  const int apiCode = doc["error_code"] | 0;
+  out.apiErrorCode = apiCode;
+
+  // 429 Too Many Requests: usa retry_after se presente
+  if (apiCode == 429)
+  {
+    const uint32_t retryAfterS = doc["parameters"]["retry_after"] | 0;
+    out.retryAfterMs = retryAfterS * 1000UL;
+    out.res = DEL_RETRY;
+    return out;
+  }
+
+  // Errori tipicamente permanenti per delete: scarta e vai avanti
+  // (es. "message can't be deleted..." / "message to delete not found")
+  if (apiCode == 400)
+  {
+    out.res = DEL_DROP;
+    return out;
+  }
+
+  // Altri errori: ritenta qualche volta
+  out.res = DEL_RETRY;
+  return out;
+}
+
+static inline void popDeleteHead()
+{
+  delHead = (uint8_t)((delHead + 1) % (sizeof(delQ) / sizeof(delQ[0])));
+  delCount--;
 }
 
 static void processDeleteQueue()
 {
-  if (health.telegramIrraggiungibile)
-    return;
   if (delCount == 0)
     return;
-
-  if (delCount == 0)
+  if (WiFi.status() != WL_CONNECTED)
     return;
 
   const uint32_t now = millis();
   if ((int32_t)(now - delNextMs) < 0)
     return;
-  delNextMs = now + DELETE_MIN_INTERVAL_MS;
 
   DeleteReq &r = delQ[delHead];
 
-  const bool ok = deleteNow(r.chatId, r.msgId);
-  if (ok)
+  // TTL scaduto -> scarta
+  if ((uint32_t)(now - r.enqMs) > r.ttlMs)
   {
-    // pop
-    delHead = (uint8_t)((delHead + 1) % (sizeof(delQ) / sizeof(delQ[0])));
-    delCount--;
+    popDeleteHead();
+    delNextMs = now + DELETE_MIN_INTERVAL_MS;
     return;
   }
 
-  // retry limitato (per non rimanere bloccati)
-  r.retries++;
-  if (r.retries >= 3)
+  DelOutcome o = deleteNow(r.chatId, r.msgId);
+
+  if (o.res == DEL_OK || o.res == DEL_DROP)
   {
-    delHead = (uint8_t)((delHead + 1) % (sizeof(delQ) / sizeof(delQ[0])));
-    delCount--;
+    popDeleteHead();
+    delNextMs = now + DELETE_MIN_INTERVAL_MS;
+    return;
+  }
+
+  // RETRY
+  r.retries++;
+  if (r.retries >= 6)
+  {
+    popDeleteHead();
+    delNextMs = now + DELETE_MIN_INTERVAL_MS;
+    return;
+  }
+
+  // Backoff
+  uint32_t waitMs = DELETE_MIN_INTERVAL_MS;
+  if (o.apiErrorCode == 429)
+  {
+    waitMs = (o.retryAfterMs > 0) ? o.retryAfterMs : 5000UL;
   }
   else
   {
-    // piccolo backoff extra se fallisce
-    delNextMs = now + (DELETE_MIN_INTERVAL_MS * 2);
+    uint8_t sh = r.retries;
+    if (sh > 3)
+      sh = 3;
+    waitMs = DELETE_MIN_INTERVAL_MS * (1UL << sh);
+    if (waitMs > 15000UL)
+      waitMs = 15000UL;
   }
+
+  delNextMs = now + waitMs;
 }
 
-/*
-Aggiungere emoji nei log e nei messaggi
+// funzione Helper per log
+static inline String boolToEmoji(bool v, bool inverted)
+{
+  if (inverted)
+    v = !v;
+  return v ? "✅" : "❌";
+}
 
+static inline String umiditaStatusEmoji(int um)
+{
+  if (um < 20)
+    return "🔴 CRITICA";
+  if (um < 30)
+    return "🟠 BASSA";
+  if (um < 60)
+    return "🟢 OTTIMALE";
+  if (um < 80)
+    return "🔵 ALTA";
+  return "🟣 SATURA";
+}
+
+// statistiche giornaliere
+void nightlyReportTick(uint32_t nowMs)
+{
+  static uint32_t nextCheckMs = 0;
+  if ((int32_t)(nowMs - nextCheckMs) < 0)
+    return;
+  nextCheckMs = nowMs + 60000UL; // ogni 30s, leggero
+
+  if (!timeReady)
+    return;
+
+  struct tm t;
+  if (!getLocalTime(&t, 50))
+    return;
+
+  const bool inWindow =
+      (t.tm_hour == NIGHT_REPORT_HOUR) &&
+      (t.tm_min >= NIGHT_REPORT_MIN_FROM) &&
+      (t.tm_min <= NIGHT_REPORT_MIN_TO);
+
+  if (!inWindow)
+    return;
+
+  const uint32_t dayId = computeDayId();
+  if (dayId == 0)
+    return;
+
+  if (stats.lastReportDayId == dayId)
+    return; // già inviato oggi
+
+  // opzionale: evita invio mentre irriga
+  if (offTimeMot1 != 0 || offTimeMot2 != 0)
+    return;
+
+  sendNightlyReport();
+  resetDailyStats();
+  stats.lastReportDayId = dayId; // set dopo il reset
+}
+
+static void sendNightlyReport()
+{
+  String msg;
+  msg.reserve(1200);
+
+  // media safe
+  const float avg1 = (stats.humN1 > 0) ? (float)stats.humSum1 / (float)stats.humN1 : -1.0f;
+  const float avg2 = (stats.humN2 > 0) ? (float)stats.humSum2 / (float)stats.humN2 : -1.0f;
+
+  msg += "REPORT NOTTURNO\n";
+
+  msg += "Log: WARN ";
+  msg += String(stats.warnCount);
+  msg += " / ERROR ";
+  msg += String(stats.errCount);
+  msg += "\n";
+
+  msg += "Umidita P1: ";
+  if (stats.humN1 == 0)
+    msg += "ND\n";
+  else
+  {
+    msg += "min ";
+    msg += String(stats.humMin1);
+    msg += " avg ";
+    msg += String(avg1, 1);
+    msg += " max ";
+    msg += String(stats.humMax1);
+    msg += "\n";
+  }
+
+  msg += "Umidita P2: ";
+  if (stats.humN2 == 0)
+    msg += "ND\n";
+  else
+  {
+    msg += "min ";
+    msg += String(stats.humMin2);
+    msg += " avg ";
+    msg += String(avg2, 1);
+    msg += " max ";
+    msg += String(stats.humMax2);
+    msg += "\n";
+  }
+
+  msg += "Irrigazioni: M1 ";
+  msg += String(stats.irrCount1);
+  msg += " (";
+  msg += String(stats.irrSec1);
+  msg += "s), M2 ";
+  msg += String(stats.irrCount2);
+  msg += " (";
+  msg += String(stats.irrSec2);
+  msg += "s)\n";
+
+  msg += "Blocchi: pioggia ";
+  msg += String(stats.blockRain);
+  msg += ", troppo presto ";
+  msg += String(stats.blockTooSoon);
+  msg += ", limite giorno ";
+  msg += String(stats.blockDayLimit);
+  msg += "\n";
+
+  // ultimi warning ed errori
+  msg += "\n";
+  msg += tailWarnError(20, false);
+
+  bot.sendMessage(CHAT_ID, msg, "");
+}
+
+static inline void resetDailyStats()
+{
+  stats = DailyStats();            // reset totale (richiede costruttori/valori di default)
+}
+/*
 crear ciclo di controllo
 
 Creare controllo livello acqua
 
 wifi Sleep mode solo di notte
-
-POLLING ADATTIVO (di notte alto e quanod messaggio veloce per 5 minuti) (modifica con messaggio telegram, motori accesi, telnet connesso, sensori rilevano irrigazione)
-
-in caso di mancata risposta dei secondi del motore
-unsigned long stateTimeout = 0;
-if (botstate != IDLE && millis() > stateTimeout) {
-  botstate = IDLE;
-}
-
-Utilizzare doppio core
-
-yield();
-
-correggere bug di avvio motori
 
 check notturno che manda statistiche, qunait warning e error, umidità minima massima e media, irrigazioni totali
 
@@ -2032,6 +2405,9 @@ sistemare boot con messaggi su telnet
 
 implementazione nella ricerca meteo di controllo se piovera nelle prossime 3 ore
 
-correggere: Telegram: in backoff, attendo 0s
+POLLING ADATTIVO (di notte alto e quanod messaggio veloce per 5 minuti) (modifica con messaggio telegram, motori accesi, telnet connesso, sensori rilevano irrigazione)
 
+Utilizzare doppio core
+
+yield();
 */
