@@ -1,4 +1,4 @@
-// rifatto deleteMessage, correzione messaggi di avvio entrambi i motori
+// aggiunto messaggio riassunto quando si accende telnet, aggiunto ignore meteo quando attivati da telegram
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -10,6 +10,7 @@
 #include <SPIFFS.h>
 #include <math.h>
 #include "esp_heap_caps.h"
+#include <esp_system.h>
 
 #include "secrets.h"
 
@@ -154,6 +155,7 @@ const uint8_t MAX_IRRIGATIONS_DAY = 10;
 const uint16_t MIN_FREE_KB = 50;
 const uint16_t SENSOR_LOW = 500;
 const uint16_t SENSOR_HIGH = 4000;
+RTC_DATA_ATTR uint32_t bootCounter = 0;
 
 // Intervalli check (ottimizzati)
 const uint8_t CHECK_TEMP = 30UL;
@@ -163,49 +165,6 @@ const uint8_t CHECK_MOTOR = 5UL;
 const uint8_t CHECK_TELEGRAM = 60UL;
 const uint8_t CHECK_SENS = 20UL;
 
-// delete Message
-WiFiClientSecure deleteClient;                       //  Client dedicato SOLO alle delete (non usare lo stesso "client" del bot)
-static const uint32_t DELETE_MIN_INTERVAL_MS = 1200; // allineato al tuo TELEGRAM_MIN_INTERVAL_MS
-
-enum DeleteKind : uint8_t
-{
-  DEL_CALLBACK = 1,
-  DEL_USERMSG = 2,
-  DEL_BOTMSG = 3
-};
-
-struct DeleteReq
-{
-  char chatId[24];
-  uint32_t msgId;
-  uint8_t retries;
-  DeleteKind kind;
-  uint32_t enqMs; // millis() quando lo accodi
-  uint32_t ttlMs; // durata massima di retry per questo messaggio
-};
-
-static DeleteReq delQ[12];
-static uint8_t delHead = 0, delTail = 0, delCount = 0;
-static uint32_t delNextMs = 0;
-
-static const uint32_t TTL_CALLBACK_MS = 30UL * 60UL * 1000UL;      // 30 min per eliminare messaggi di callback
-static const uint32_t TTL_USERMSG_MS = 6UL * 60UL * 60UL * 1000UL; // 6 ore per eliminare messaggi dell'utente
-static const uint32_t TTL_BOTMSG_MS = 2UL * 60UL * 60UL * 1000UL;  // 2 ore per eliminare messaggi del bot temporanei
-
-enum DelResult : uint8_t
-{
-  DEL_OK,
-  DEL_RETRY,
-  DEL_DROP
-};
-
-struct DelOutcome
-{
-  DelResult res;
-  uint32_t retryAfterMs; // 0 se non presente
-  int httpCode;          // per log/debug
-  int apiErrorCode;      // 0 se non presente
-};
 
 // variabili per irrigazione automatica
 struct AutoZone
@@ -290,7 +249,7 @@ static DailyStats stats;
 
 static const uint8_t NIGHT_REPORT_HOUR = 3; // orario per generare il report
 static const uint8_t NIGHT_REPORT_MIN_FROM = 0;
-static const uint8_t NIGHT_REPORT_MIN_TO = 60; // intervallo di 1 ora per generarlo
+static const uint8_t NIGHT_REPORT_MIN_TO = 59; // intervallo di 1 ora per generarlo
 
 // Prototipi di log
 String getTime();
@@ -307,6 +266,7 @@ void handleTelnetCommand(const String &cmd);
 void telnetSendTail(const char *path, int maxLines);
 void telnetPrintWarnErrorFile(const char *path);
 void telnetPrintAllWarnError(bool includeOld);
+static void telnetWelcome();
 
 // Prototipi dei sensori
 void leggiSensori(int umidita[2]);
@@ -349,13 +309,7 @@ void checkMotori();
 // check irrigazioni
 uint32_t computeDayId();
 void dailyResetTick(uint32_t nowMs);
-bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, IrrigationBlockReason &reason, uint8_t &motBlocked, uint16_t &waitMin);
-
-// delete Message
-static bool enqueueDelete(const String &chatId, uint32_t msgId, DeleteKind kind);
-static DelOutcome deleteNow(const char *chatId, uint32_t msgId);
-static void processDeleteQueue();
-static inline void popDeleteHead();
+bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, IrrigationBlockReason &reason, uint8_t &motBlocked, uint16_t &waitMin, bool ignoreMeteo = false);
 
 // funzione Helper per log
 static inline String boolToEmoji(bool v, bool inverted = false);
@@ -363,13 +317,16 @@ static inline String umiditaStatusEmoji(int um);
 
 // statistiche giornaliere
 void nightlyReportTick(uint32_t nowMs);
-static void sendNightlyReport();
+static bool sendNightlyReport();
 static void resetDailyStats();
 
 void setup()
 {
+  bootCounter++;
   Serial.begin(115200);
   delay(200);
+
+  Serial.printf("boot #%u reason = %d\n", bootCounter, (int)esp_reset_reason());
 
   // logLine(DEBUG_L, "🚀 Boot ESP32...", true, false);
 
@@ -412,13 +369,8 @@ void setup()
   client.setTimeout(2000);
   bot.waitForResponse = 3000;
 
-  // delete Message
-  deleteClient.setHandshakeTimeout(7);
-  deleteClient.setCACert(TELEGRAM_CERTIFICATE_ROOT);
-  deleteClient.setTimeout(2000);
-
   // Messaggio di avvio
-  bot.sendMessage(CHAT_ID, "BOT ATTIVO!", "");
+  bot.sendMessage(CHAT_ID, "BOT ATTIVO " + WiFi.macAddress() + " boot#" + String(bootCounter), "");
 
   // Avvio modalita OTA
   ArduinoOTA.setHostname("esp32-ota");
@@ -520,7 +472,7 @@ void loop()
   }
 
   // elimina i messaggi
-  processDeleteQueue();
+  //processDeleteQueue();
 }
 
 // Funzioni di log
@@ -733,10 +685,15 @@ void handleTelnet()
 {
   if (telnetServer.hasClient())
   {
-    if (telnetClient && telnetClient.connected())
-      telnetClient.stop();
-    telnetClient = telnetServer.available();
-    telnetClient.println("Telnet OK. Comandi: tail, alert, clear, size");
+    WiFiClient newClient = telnetServer.available();
+    if (newClient)
+    {
+      if (telnetClient && telnetClient.connected())
+        telnetClient.stop();
+      telnetClient = newClient;
+      telnetClient.println("Telnet OK. Comandi: tail, alert, clear, size");
+      telnetWelcome();
+    }
   }
 
   if (!(telnetClient && telnetClient.connected()))
@@ -905,7 +862,30 @@ void telnetPrintAllWarnError(bool includeOld = true)
   if (includeOld)
     telnetPrintWarnErrorFile("/log.old");
   telnetPrintWarnErrorFile("/log.txt");
-  telnetClient.println("-- EOF --\n");
+  // telnetClient.println("-- EOF --\n");
+}
+
+static void telnetWelcome()
+{
+  if (!telnetClient || !telnetClient.connected())
+    return;
+
+  telnetClient.println();
+  telnetClient.println("=== ESP32 TELNET ===");
+  telnetClient.println("IP: " + WiFi.localIP().toString());
+  telnetClient.println("Uptime(ms): " + String(millis()));
+  telnetClient.println("Comandi: tail [n], alert, clear, size");
+
+  if (!spiffsOK)
+  {
+    telnetClient.println("SPIFFS non montato, niente log.");
+    telnetClient.println("=== END ===");
+    return;
+  }
+
+  telnetPrintAllWarnError(true);
+
+  telnetClient.println("=== END ===");
 }
 
 // sensori
@@ -1187,7 +1167,7 @@ void handleCallBack(String text, String chatId, String messageId)
   const uint32_t now = millis();
 
   // delete message
-  enqueueDelete(chatId, (uint32_t)messageId.toInt(), DEL_CALLBACK);
+  // enqueueDelete(chatId, (uint32_t)messageId.toInt(), DEL_CALLBACK);
 
   // 1) Scelta tempo: gestiscila SUBITO e qui avvia davvero l'irrigazione
   if (text.startsWith("t_"))
@@ -1218,7 +1198,7 @@ void handleCallBack(String text, String chatId, String messageId)
     uint16_t waitM = 0;
     IrrigationBlockReason rr = IRR_OK;
 
-    const bool ok = requestIrrigation(pendingMotor, seconds, "MANUALE", rr, motB, waitM);
+    const bool ok = requestIrrigation(pendingMotor, seconds, "MANUALE", rr, motB, waitM, true);
 
     if (!ok)
     {
@@ -1296,7 +1276,7 @@ void handleMessage(String text, String chatId, String messageId)
 {
   text.trim(); // togli spazi / \n
 
-  enqueueDelete(chatId, (uint32_t)messageId.toInt(), DEL_USERMSG);
+  // enqueueDelete(chatId, (uint32_t)messageId.toInt(), DEL_USERMSG);
 
   if (text == "/meteo")
   {
@@ -2019,7 +1999,7 @@ static bool checkOneMotorGate(uint8_t mot, uint32_t nowMs, IrrigationBlockReason
   return true;
 }
 
-bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, IrrigationBlockReason &reason, uint8_t &motBlocked, uint16_t &waitMin)
+bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, IrrigationBlockReason &reason, uint8_t &motBlocked, uint16_t &waitMin, bool ignoreMeteo)
 {
   const uint32_t now = millis();
   dailyResetTick(now);
@@ -2029,7 +2009,7 @@ bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, Irrigat
   waitMin = 0;
 
   // Rispetta pioggia/blocco anche in manuale (se vuoi bypass manuale dimmelo)
-  if (!irrigazioneConsentita())
+  if (!irrigazioneConsentita() && !ignoreMeteo)
   {
     reason = IRR_RAIN_BLOCK;
     stats.blockRain++;
@@ -2099,165 +2079,6 @@ bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, Irrigat
   return true;
 }
 
-// delete Message
-static bool enqueueDelete(const String &chatId, uint32_t msgId, DeleteKind kind)
-{
-  if (delCount >= (sizeof(delQ) / sizeof(delQ[0])))
-    return false;
-  DeleteReq &r = delQ[delTail];
-  memset(&r, 0, sizeof(r));
-  chatId.toCharArray(r.chatId, sizeof(r.chatId));
-  r.msgId = msgId;
-  r.retries = 0;
-  r.kind = kind;
-  r.enqMs = millis();
-  r.ttlMs = (kind == DEL_CALLBACK) ? TTL_CALLBACK_MS : (kind == DEL_USERMSG) ? TTL_USERMSG_MS
-                                                                             : TTL_BOTMSG_MS;
-  delTail = (uint8_t)((delTail + 1) % (sizeof(delQ) / sizeof(delQ[0])));
-  delCount++;
-  return true;
-}
-
-static DelOutcome deleteNow(const char *chatId, uint32_t msgId)
-{
-  DelOutcome out{DEL_RETRY, 0, 0, 0};
-
-  if (WiFi.status() != WL_CONNECTED)
-    return out;
-
-  char url[256];
-  snprintf(url, sizeof(url),
-           "https://api.telegram.org/bot%s/deleteMessage?chat_id=%s&message_id=%u",
-           BOTtoken, chatId, (unsigned)msgId);
-
-  HTTPClient http;
-  http.setTimeout(3000); // un po' più alto del tuo 1000ms
-  if (!http.begin(deleteClient, url))
-  {
-    http.end();
-    return out;
-  }
-
-  const int httpCode = http.GET();
-  out.httpCode = httpCode;
-
-  String body;
-  if (httpCode > 0)
-    body = http.getString();
-  http.end();
-
-  // Errori di rete/SSL: ritenta
-  if (httpCode <= 0)
-  {
-    out.res = DEL_RETRY;
-    return out;
-  }
-
-  // Prova a capire l'esito applicativo dal JSON
-  StaticJsonDocument<384> doc;
-  DeserializationError err = deserializeJson(doc, body);
-  if (err)
-  {
-    out.res = (httpCode == 200) ? DEL_OK : DEL_RETRY; // fallback prudente
-    return out;
-  }
-
-  const bool ok = doc["ok"] | false;
-  if (ok)
-  {
-    out.res = DEL_OK;
-    return out;
-  }
-
-  const int apiCode = doc["error_code"] | 0;
-  out.apiErrorCode = apiCode;
-
-  // 429 Too Many Requests: usa retry_after se presente
-  if (apiCode == 429)
-  {
-    const uint32_t retryAfterS = doc["parameters"]["retry_after"] | 0;
-    out.retryAfterMs = retryAfterS * 1000UL;
-    out.res = DEL_RETRY;
-    return out;
-  }
-
-  // Errori tipicamente permanenti per delete: scarta e vai avanti
-  // (es. "message can't be deleted..." / "message to delete not found")
-  if (apiCode == 400)
-  {
-    out.res = DEL_DROP;
-    return out;
-  }
-
-  // Altri errori: ritenta qualche volta
-  out.res = DEL_RETRY;
-  return out;
-}
-
-static inline void popDeleteHead()
-{
-  delHead = (uint8_t)((delHead + 1) % (sizeof(delQ) / sizeof(delQ[0])));
-  delCount--;
-}
-
-static void processDeleteQueue()
-{
-  if (delCount == 0)
-    return;
-  if (WiFi.status() != WL_CONNECTED)
-    return;
-
-  const uint32_t now = millis();
-  if ((int32_t)(now - delNextMs) < 0)
-    return;
-
-  DeleteReq &r = delQ[delHead];
-
-  // TTL scaduto -> scarta
-  if ((uint32_t)(now - r.enqMs) > r.ttlMs)
-  {
-    popDeleteHead();
-    delNextMs = now + DELETE_MIN_INTERVAL_MS;
-    return;
-  }
-
-  DelOutcome o = deleteNow(r.chatId, r.msgId);
-
-  if (o.res == DEL_OK || o.res == DEL_DROP)
-  {
-    popDeleteHead();
-    delNextMs = now + DELETE_MIN_INTERVAL_MS;
-    return;
-  }
-
-  // RETRY
-  r.retries++;
-  if (r.retries >= 6)
-  {
-    popDeleteHead();
-    delNextMs = now + DELETE_MIN_INTERVAL_MS;
-    return;
-  }
-
-  // Backoff
-  uint32_t waitMs = DELETE_MIN_INTERVAL_MS;
-  if (o.apiErrorCode == 429)
-  {
-    waitMs = (o.retryAfterMs > 0) ? o.retryAfterMs : 5000UL;
-  }
-  else
-  {
-    uint8_t sh = r.retries;
-    if (sh > 3)
-      sh = 3;
-    waitMs = DELETE_MIN_INTERVAL_MS * (1UL << sh);
-    if (waitMs > 15000UL)
-      waitMs = 15000UL;
-  }
-
-  delNextMs = now + waitMs;
-}
-
 // funzione Helper per log
 static inline String boolToEmoji(bool v, bool inverted)
 {
@@ -2285,7 +2106,7 @@ void nightlyReportTick(uint32_t nowMs)
   static uint32_t nextCheckMs = 0;
   if ((int32_t)(nowMs - nextCheckMs) < 0)
     return;
-  nextCheckMs = nowMs + 60000UL; // ogni 30s, leggero
+  nextCheckMs = nowMs + 60000UL; // ogni 60s, leggero
 
   if (!timeReady)
     return;
@@ -2313,13 +2134,22 @@ void nightlyReportTick(uint32_t nowMs)
   if (offTimeMot1 != 0 || offTimeMot2 != 0)
     return;
 
-  sendNightlyReport();
-  resetDailyStats();
-  stats.lastReportDayId = dayId; // set dopo il reset
+  const bool ok = sendNightlyReport();
+  if (ok)
+  {
+    resetDailyStats();
+    stats.lastReportDayId = dayId; // set dopo il reset
+  }
+  else
+  {
+    logLine(WARN, "⚠️ Report notturno NON inviato (Telegram/WiFi). Riprovo nella finestra.", true, false);
+  }
 }
 
-static void sendNightlyReport()
+static bool sendNightlyReport()
 {
+  static const size_t TG_MAX = 3900; // margine sotto 4096
+
   String msg;
   msg.reserve(1200);
 
@@ -2381,27 +2211,41 @@ static void sendNightlyReport()
   msg += String(stats.blockDayLimit);
   msg += "\n";
 
-  // ultimi warning ed errori
+  // ultimi warning ed errori (troncati se troppo lunghi)
   msg += "\n";
-  msg += tailWarnError(20, false);
+  String tail = tailWarnError(20, false);
+  size_t room = (msg.length() < TG_MAX) ? (TG_MAX - msg.length()) : 0;
+  if (tail.length() > room)
+  {
+    tail = tail.substring(0, room);
+    // opzionale: piccola nota finale (se c'è spazio)
+    if (tail.length() >= 15)
+    {
+      tail.remove(tail.length() - 15);
+      tail += "\n...(troncato)";
+    }
+  }
+  msg += tail;
 
-  bot.sendMessage(CHAT_ID, msg, "");
+  // ACK: torna true/false
+  return bot.sendMessage(CHAT_ID, msg, "");
 }
 
 static inline void resetDailyStats()
 {
-  stats = DailyStats();            // reset totale (richiede costruttori/valori di default)
+  stats = DailyStats(); // reset totale (richiede costruttori/valori di default)
 }
+
 /*
 crear ciclo di controllo
+
+rifare meteo che blocca quando non deve
+
+sistemare warning json
 
 Creare controllo livello acqua
 
 wifi Sleep mode solo di notte
-
-check notturno che manda statistiche, qunait warning e error, umidità minima massima e media, irrigazioni totali
-
-sistemare boot con messaggi su telnet
 
 implementazione nella ricerca meteo di controllo se piovera nelle prossime 3 ore
 
