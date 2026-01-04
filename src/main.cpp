@@ -1,4 +1,4 @@
-// modificata la libreria dle bot telegram che causava warning alla compilazione, aggiunto controllo in ora successive, sistemato ordine variabili globali
+// impementato polling adattivo che di notte passa da 3s a 20s ma torna attivo (a 2s) se: riceve un messaggio, motori si accendono, telnet si connette, sensori rilevano irrigazione neccessaria e aggiunto wifi sleep mode che segue il polling adattivo
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -11,6 +11,7 @@
 #include <math.h>
 #include "esp_heap_caps.h"
 #include <esp_system.h>
+#include <esp_wifi.h>
 
 #include "secrets.h"
 
@@ -89,6 +90,15 @@ const uint8_t CHECK_TELEGRAM = 60UL; // Ogni quanto gestire check Telegram (se u
 const uint8_t CHECK_SENS = 20UL;     // Ogni quanto leggere sensori umidità.
 
 RTC_DATA_ATTR uint32_t bootCounter = 0; // Contatore boot in RTC memory (persistente).
+
+// Polling Telegram adattivo
+static const uint32_t POLL_DAY_MS = 3000;
+static const uint32_t POLL_NIGHT_MS = 20000;
+static const uint32_t POLL_BOOST_MS = 2500;    // quanto spesso durante boost (reattivo)
+static const uint32_t BOOST_MSG_MS = 120000;   // 2 min dopo msg Telegram
+static const uint32_t BOOST_MOTOR_MS = 300000; // 5 min quando motori ON
+static const uint32_t BOOST_TELNET_MS = 60000; // 1 min dopo connessione telnet (poi rinnovi se resta attivo)
+static const uint32_t BOOST_IRR_MS = 180000;   // 3 min se irrigazione richiesta/partita
 
 // ========================= STRUTTURE DATI =========================
 struct DatiMeteo
@@ -213,6 +223,12 @@ static const uint8_t NIGHT_REPORT_HOUR = 3;     // Ora invio report notturno.
 static const uint8_t NIGHT_REPORT_MIN_FROM = 0; // Minuto inizio finestra report.
 static const uint8_t NIGHT_REPORT_MIN_TO = 59;  // Minuto fine finestra report.
 
+static uint32_t pollBoostUntilMs = 0; // fino a quando restare in boost
+static uint32_t nextPollMs = 0;       // scheduler (al posto di lastTimeBotRan + botRequestDelay)
+
+static bool wifiPsOn = false;
+static uint32_t nextWifiPolicyMs = 0;
+
 // ========================= RETE / SERVIZI =========================
 const char *ssid = SECRET_WIFI_SSID;     // SSID WiFi (secrets.h).
 const char *password = SECRET_WIFI_PASS; // Password WiFi (secrets.h).
@@ -231,8 +247,6 @@ WiFiClient telnetClient;     // Client Telnet corrente.
 String telnetLine;           // Buffer riga comandi Telnet.
 
 // ========================= SCHEDULER TELEGRAM =========================
-int botRequestDelay = 3000;                          // ms tra due poll getUpdates.
-unsigned long lastTimeBotRan = 0;                    // millis() ultimo poll Telegram.
 unsigned long lastTelegramMs = 0;                    // millis() ultimo invio messaggio (anti-spam).
 const unsigned long TELEGRAM_MIN_INTERVAL_MS = 1200; // ms min tra sendMessage.
 
@@ -319,6 +333,15 @@ void nightlyReportTick(uint32_t nowMs);
 static bool sendNightlyReport();
 static void resetDailyStats();
 
+// helper per polling e wifi sleep mode adattivi
+static inline bool isNightHour(int h);
+static inline void boostPolling(uint32_t ms);
+static inline uint32_t currentPollDelayMs(int hourNow);
+static inline void wifiFollowPolling(uint32_t nowMs, uint32_t delayMs);
+static inline bool isBoostedNow(uint32_t nowMs);
+static inline bool motorsOnNow();
+static inline bool telnetOnNow();
+
 void setup()
 {
   bootCounter++;
@@ -365,8 +388,8 @@ void setup()
   // Certificato root per Telegram HTTPS
   client.setHandshakeTimeout(7);
   client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
-  client.setTimeout(2000);
-  bot.waitForResponse = 3000;
+  client.setTimeout(8000);
+  bot.waitForResponse = 5000;
 
   // Messaggio di avvio
   bot.sendMessage(CHAT_ID, "BOT ATTIVO " + WiFi.macAddress() + " boot#" + String(bootCounter), "");
@@ -394,7 +417,7 @@ void loop()
   ArduinoOTA.handle();
   unsigned long now = millis();
 
-  dailyResetTick(millis());
+  dailyResetTick(now);
 
   // report notturno
   nightlyReportTick(now);
@@ -432,46 +455,57 @@ void loop()
     lastAutoSense = now;
     handleSensore(false);
   }
+  
+  // --- polling adattivo ---
+  int hourNow = 12;
+  if (timeReady)
+  {
+    struct tm t;
+    if (getLocalTime(&t, 50))
+      hourNow = t.tm_hour;
+  }
 
-  // Gestione bot Telegram ogni botRequestDelay ms
-  if (now - lastTimeBotRan > (unsigned long)botRequestDelay)
+  uint32_t delayMs = currentPollDelayMs(hourNow);
+
+  wifiFollowPolling(now, delayMs);
+
+  if ((int32_t)(now - nextPollMs) >= 0)
   {
     int numNewMessages = safeGetUpdates();
-    lastTimeBotRan = now;
+    if (numNewMessages > 0)
+    boostPolling(BOOST_MSG_MS);
+    wifiFollowPolling(now, currentPollDelayMs(hourNow));
 
     if (numNewMessages > 0)
     {
       for (int i = 0; i < numNewMessages; i++)
       {
-        // evita messaggi doppi
         long uid = bot.messages[i].update_id;
         if (uid <= lastHandledUpdateId)
           continue;
         lastHandledUpdateId = uid;
 
-        // salva tutte le informazioni
         String type = bot.messages[i].type;
         String text = bot.messages[i].text;
         String chatId = bot.messages[i].chat_id;
+
         int msgIdiNT = bot.messages[i].message_id;
-        String messageId = String(msgIdiNT); // ID per cancellare
+        String messageId = String(msgIdiNT);
 
         if (type == "message")
         {
-          logLine(DEBUG_L, String("Messaggio:") + text, true, false);
+          logLine(DEBUG_L, String("Messaggio: ") + text, true, false);
           handleMessage(text, chatId, messageId);
         }
         else if (type == "callback_query")
         {
-          logLine(DEBUG_L, String("messaggio ") + text, true, false);
+          logLine(DEBUG_L, String("Callback: ") + text, true, false);
           handleCallBack(text, chatId, messageId);
         }
       }
     }
+    nextPollMs = now + delayMs;
   }
-
-  // elimina i messaggi
-  // processDeleteQueue();
 }
 
 // Funzioni di log
@@ -682,11 +716,13 @@ void initLogSize()
 
 void handleTelnet()
 {
+
   if (telnetServer.hasClient())
   {
     WiFiClient newClient = telnetServer.available();
     if (newClient)
     {
+      boostPolling(BOOST_TELNET_MS);
       if (telnetClient && telnetClient.connected())
         telnetClient.stop();
       telnetClient = newClient;
@@ -697,6 +733,11 @@ void handleTelnet()
 
   if (!(telnetClient && telnetClient.connected()))
     return;
+
+  if (telnetClient && telnetClient.connected())
+  {
+    boostPolling(2000); // piccolo rinnovo continuo, leggero
+  }
 
   while (telnetClient.available())
   {
@@ -1000,6 +1041,7 @@ void handleSensore(bool toTelegram)
 // motori
 void accendiMotori(int who, int tempo)
 {
+  boostPolling(BOOST_MOTOR_MS);
   const uint32_t now = millis();
   const bool was1On = (offTimeMot1 != 0);
   const bool was2On = (offTimeMot2 != 0);
@@ -1086,7 +1128,6 @@ void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk)
   if (!sensoreOk)
     return;
 
-  // (Opzionale) se vuoi che sia requestIrrigation a dirti IRR_RAIN_BLOCK, rimuovi questo check
   if (!irrigazioneConsentita())
     return;
 
@@ -1164,9 +1205,6 @@ static inline String motorLabel(uint8_t m)
 void handleCallBack(String text, String chatId, String messageId)
 {
   const uint32_t now = millis();
-
-  // delete message
-  // enqueueDelete(chatId, (uint32_t)messageId.toInt(), DEL_CALLBACK);
 
   // 1) Scelta tempo: gestiscila SUBITO e qui avvia davvero l'irrigazione
   if (text.startsWith("t_"))
@@ -1274,8 +1312,6 @@ void handleCallBack(String text, String chatId, String messageId)
 void handleMessage(String text, String chatId, String messageId)
 {
   text.trim(); // togli spazi / \n
-
-  // enqueueDelete(chatId, (uint32_t)messageId.toInt(), DEL_USERMSG);
 
   if (text == "/meteo")
   {
@@ -1931,17 +1967,17 @@ int safeGetUpdates()
   }
 
   uint16_t old = bot.waitForResponse;
-  bot.waitForResponse = 3000;
-  client.setHandshakeTimeout(30);
-
-  int n = bot.getUpdates(lastHandledUpdateId + 1);
+  client.setHandshakeTimeout(10);
 
   bot.waitForResponse = old;
 
-  if (n >= 0)
+  int n = bot.getUpdates(lastHandledUpdateId + 1);
+
+  health.lastSuccessfulTelegramComm = now;
+
+  if (n > 0)  // n>0: messaggi ricevuti → reset completo
   {
     health.telegramIrraggiungibile = false;
-    health.lastSuccessfulTelegramComm = now;
 
     if (wasOffline)
     {
@@ -1950,12 +1986,19 @@ int safeGetUpdates()
     }
 
     backoffMs = 3000;
-    lastLoggedBackoffMs = 0; // reset: così al prossimo errore rilogghe
-    nextTryMs = now + (uint32_t)botRequestDelay;
+    lastLoggedBackoffMs = 0;
+    nextTryMs = 0;  // Reset backoff, usa polling adattivo del loop
     return n;
   }
+  else if (n >= 0)  // n==0: OK ma vuoto → no backoff
+  {
+    // Vuoto ma connessione OK → polling normale continua
+    backoffMs = 3000;
+    nextTryMs = 0;  // No backoff forzato
+    return 0;
+  }
 
-  // Errore
+  // ❌ ERRORE VERO: solo se n < 0
   health.telegramIrraggiungibile = true;
   wasOffline = true;
 
@@ -1969,7 +2012,7 @@ int safeGetUpdates()
   // Logga solo se il backoff è cambiato (o se è passato molto tempo)
   if (backoffChanged || (now - lastFailLogMs > 60000UL))
   {
-    logLine(WARN, "⚠️🤖 Telegram getUpdates fallito, backoff " + String(newBackoff) + "ms", true, false);
+    logLine(WARN, "⚠️🤖 Telegram getUpdates fallito (n=" + String(n) + "), backoff " + String(newBackoff) + "ms", true, false);
     lastFailLogMs = now;
     lastLoggedBackoffMs = newBackoff;
   }
@@ -1980,6 +2023,7 @@ int safeGetUpdates()
   client.stop();
   return 0;
 }
+
 
 void checkMemory()
 {
@@ -2163,6 +2207,7 @@ static bool checkOneMotorGate(uint8_t mot, uint32_t nowMs, IrrigationBlockReason
 
 bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, IrrigationBlockReason &reason, uint8_t &motBlocked, uint16_t &waitMin, bool ignoreMeteo)
 {
+  boostPolling(BOOST_IRR_MS);
   const uint32_t now = millis();
   dailyResetTick(now);
 
@@ -2398,18 +2443,92 @@ static inline void resetDailyStats()
   stats = DailyStats(); // reset totale (richiede costruttori/valori di default)
 }
 
-/*
-crear ciclo di controllo
+// helper per polling e wifi sleep mode adattivi
+static inline bool isNightHour(int h)
+{
+  return (h < ora_Inizio_Giorno || h > ora_Fine_Giorno);
+}
 
-rifare meteo che blocca quando non deve
+static inline void boostPolling(uint32_t ms)
+{
+  uint32_t now = millis();
+  uint32_t until = now + ms;
+  if ((int32_t)(until - pollBoostUntilMs) > 0)
+    pollBoostUntilMs = until;
+  if ((int32_t)(now - nextPollMs) < 0)
+    nextPollMs = now;
+  nextWifiPolicyMs = 0;
+}
+
+static inline uint32_t currentPollDelayMs(int hourNow)
+{
+  uint32_t base = isNightHour(hourNow) ? POLL_NIGHT_MS : POLL_DAY_MS;
+  if ((int32_t)(millis() - pollBoostUntilMs) < 0)
+    return min(base, POLL_BOOST_MS);
+  return base;
+}
+
+static inline bool isBoostedNow(uint32_t nowMs)
+{
+  return (int32_t)(nowMs - pollBoostUntilMs) < 0;
+}
+
+static inline bool motorsOnNow()
+{
+  return (offTimeMot1 != 0) || (offTimeMot2 != 0);
+}
+
+static inline bool telnetOnNow()
+{
+  return (telnetClient && telnetClient.connected());
+}
+
+static inline void wifiFollowPolling(uint32_t nowMs, uint32_t delayMs)
+{
+  // Evita toggle continuo
+  if ((int32_t)(nowMs - nextWifiPolicyMs) < 0)
+    return;
+  nextWifiPolicyMs = nowMs + 5000UL;
+
+  // Vincoli richiesti:
+  // - finché non ho l’ora: full
+  // - telnet connesso: full
+  // - motori ON: full
+  // - in boost: full
+  const bool forceFull =
+      (!timeReady) || telnetOnNow() || motorsOnNow() || isBoostedNow(nowMs);
+
+  // “polling rallentato” = stai andando in modalità notte (delay grande)
+  const bool wantPs =
+      (!forceFull) &&
+      (WiFi.status() == WL_CONNECTED) &&
+      (delayMs >= POLL_NIGHT_MS);
+
+  if (wantPs == wifiPsOn)
+    return;
+
+  if (wantPs)
+  {
+    WiFi.setSleep(true);
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM); // power-save moderato
+  }
+  else
+  {
+    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE); // full-power / bassa latenza
+  }
+
+  wifiPsOn = wantPs;
+}
+
+/*
+quando motori accesi per troppo tempo mandare warnin e bloccare l'irrigazione per tempo finche non si controlla
+
+con comando /log o /alert continua a spammare messaggi su telegra
+
+riorganizzare loop e setup
 
 Creare controllo livello acqua
-
-wifi Sleep mode solo di notte
-
-implementazione nella ricerca meteo di controllo se piovera nelle prossime 3 ore
-
-POLLING ADATTIVO (di notte alto e quanod messaggio veloce per 5 minuti) (modifica con messaggio telegram, motori accesi, telnet connesso, sensori rilevano irrigazione)
 
 Utilizzare doppio core
 
