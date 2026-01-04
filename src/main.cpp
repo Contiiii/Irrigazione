@@ -1,4 +1,4 @@
-// aggiunto messaggio riassunto quando si accende telnet, aggiunto ignore meteo quando attivati da telegram
+// modificata la libreria dle bot telegram che causava warning alla compilazione, aggiunto controllo in ora successive, sistemato ordine variabili globali
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -21,25 +21,14 @@
 #define Pin_Relay1 18
 #define Pin_Relay2 19
 
-// Variabili utilizzate
-struct DatiMeteo
-{
-  bool staPiovendo;
-  String condizioniMeteo;
-  float temperatura;
-  float pioggiaUltimaOra;
-  int umidita;
-  unsigned long ultimoAggiornamento;
-  bool datiValidi;
-};
-
+// ========================= ENUM (stati/cause) =========================
 enum BotState
 {
   IDLE,
   ASK_TIME_MOT1,
   ASK_TIME_MOT2,
   ASK_TIME_BOTH
-};
+}; // Stato “conversazione” Telegram (idle/attesa durata).
 
 enum LogLevel
 {
@@ -47,209 +36,213 @@ enum LogLevel
   DEBUG_L,
   WARN,
   ERROR_L
-};
+}; // Livello severità log.
 
 enum MotorSel
 {
   Motore_1 = 1,
   Motore_2 = 2,
   Entrambi_i_Motori = 3
-};
+}; // Selettore motori/zone (1,2,entrambi).
 
-BotState botstate = IDLE;
-MotorSel pendingMotor = Motore_1;
-bool timeReady = false;
-bool spiffsOK = false;
-const size_t MAX_LOG_SIZE = 400 * 1024;
-size_t logBytes = 0;
-
-// Dati Pioggia
-DatiMeteo meteo;                                          // variabile per contenere i dati del meteo
-bool bloccoIrrigazione = false;                           // blocca irrigazione quando piove
-unsigned long scadenzaBloccoIrrigazione = 0;              // tempo dal blocco
-const unsigned long DurataBloccoPioggia = 1000 * 60 * 60; // durata blocco 1 ora
-
-const unsigned long intervallo_Refresh_Giorno = 1000 * 60 * 60;    // di giorno il refresh è ogni ora
-const unsigned long intervallo_Refresh_Notte = 1000 * 60 * 60 * 3; // di notte il refresh è ogni 3 ore
-const unsigned long durata_Cash_Valida = 1000 * 60 * 30;           // la cash dura 30 minuti
-const int soglia_Minima_Pioggia = 0.5;
-
-const int ora_Inizio_Giorno = 6; // indica l'orario di inizio giorno
-const int ora_Fine_Giorno = 23;  // indica l'orario di fine giorno
-
-// count Irrigazioni
 enum IrrigationBlockReason : uint8_t
 {
   IRR_OK = 0,
   IRR_RAIN_BLOCK,
   IRR_TOO_SOON,
   IRR_DAY_LIMIT
+}; // Motivo blocco irrigazione.
+
+// ========================= CONFIG / COSTANTI =========================
+const size_t MAX_LOG_SIZE = 400 * 1024;                         // Dimensione max /log.txt prima della rotazione.
+const unsigned long DurataBloccoPioggia = 1000UL * 60UL * 60UL; // Durata blocco standard “piove ora” (1h).
+
+const unsigned long intervallo_Refresh_Giorno = 1000UL * 60UL * 60UL;      // Refresh meteo/forecast di giorno (1h).
+const unsigned long intervallo_Refresh_Notte = 1000UL * 60UL * 60UL * 3UL; // Refresh meteo/forecast di notte (3h).
+const unsigned long durata_Cash_Valida = 1000UL * 60UL * 30UL;             // Validità cache meteo (30 min).
+const unsigned long durataCacheForecast = 1000UL * 60UL * 30UL;            // Validità cache forecast (30 min).
+const float soglia_Minima_Pioggia = 0.5f;                                  // Soglia mm per considerare “pioggia rilevante”.
+
+const int ora_Inizio_Giorno = 6; // Ora inizio fascia “giorno”.
+const int ora_Fine_Giorno = 23;  // Ora fine fascia “giorno”.
+
+const int8_t RSSI_DEBOLE = -75;     // Soglia RSSI “debole” (dBm).
+const int8_t RSSI_CRITICO = -85;    // Soglia RSSI “critico” (dBm).
+const float TEMP_WARNING = 75.0f;   // Soglia warning temperatura ESP32 (°C).
+const float TEMP_CRITICAL = 85.0f;  // Soglia critica temperatura ESP32 (°C).
+const uint8_t UMIDITA_CRITICA = 15; // Soglia umidità (%) per allarme “critica”.
+
+const uint16_t MAX_MOTOR_SECONDS = 600;     // Massima durata continua motore (fail-safe).
+const uint32_t MIN_IRRIGATION_MS = 30000UL; // Distanza minima tra irrigazioni dello stesso motore (rate-limit).
+const uint8_t MAX_IRRIGATIONS_DAY = 10;     // Max irrigazioni/giorno per motore.
+
+const uint16_t MIN_FREE_KB = 50;   // Soglia heap minima (KB) per allarme memoria.
+const uint16_t SENSOR_LOW = 500;   // Min ADC plausibile sensore (sotto = errore/disconnesso).
+const uint16_t SENSOR_HIGH = 4000; // Max ADC plausibile sensore (sopra = errore/disconnesso).
+
+// Intervalli check (secondi)
+const uint8_t CHECK_TEMP = 30UL;     // Ogni quanto controllare temperatura ESP32.
+const uint8_t CHECK_WIFI = 10UL;     // Ogni quanto controllare WiFi/RSSI.
+const uint16_t CHECK_MEMORY = 300UL; // Ogni quanto controllare heap/SPIFFS.
+const uint8_t CHECK_MOTOR = 5UL;     // Ogni quanto controllare durata motori.
+const uint8_t CHECK_TELEGRAM = 60UL; // Ogni quanto gestire check Telegram (se usato).
+const uint8_t CHECK_SENS = 20UL;     // Ogni quanto leggere sensori umidità.
+
+RTC_DATA_ATTR uint32_t bootCounter = 0; // Contatore boot in RTC memory (persistente).
+
+// ========================= STRUTTURE DATI =========================
+struct DatiMeteo
+{
+  bool staPiovendo;                  // True se sta piovendo ora (condizione o mm/h).
+  String condizioniMeteo;            // Condizione OWM (es. Rain/Clouds/Clear).
+  float temperatura;                 // Temperatura attuale (°C).
+  float pioggiaUltimaOra;            // Pioggia ultime 1h (mm).
+  int umidita;                       // Umidità attuale (%).
+  unsigned long ultimoAggiornamento; // millis() ultimo update meteo.
+  bool datiValidi;                   // True se i dati meteo sono validi.
+
+  bool forecastValidi = false;         // True se il forecast è valido.
+  unsigned long ultimoAggForecast = 0; // millis() ultimo update forecast.
+  bool pioggiaPrevista3h = false;      // True se prevista pioggia entro 3h.
+  bool pioggiaPrevista6h = false;      // True se prevista pioggia entro 6h.
+  float mmPrevisti3h = 0.0f;           // mm previsione entro 3h (slot considerati).
+  float mmPrevisti6h = 0.0f;           // mm previsione entro 6h (slot considerati).
 };
 
-static uint32_t g_nextDayCheckMs = 0; // rate-limit del check giorno
-
-// variabili Healt
 struct SystemHealth
 {
-  // Sensori
-  bool sensore1Disconnesso : 1;
-  bool sensore2Disconnesso : 1;
-  bool umiditaCritica : 1;
+  bool sensore1Disconnesso : 1; // Sensore 1 fuori range/assente.
+  bool sensore2Disconnesso : 1; // Sensore 2 fuori range/assente.
+  bool umiditaCritica : 1;      // Almeno un vaso in umidità critica.
 
-  // Temperatura ESP32
-  bool temperaturaElevata : 1;
+  bool temperaturaElevata : 1; // Temperatura ESP sopra soglia.
 
-  // WiFi
-  bool wifiDebole : 1;
-  bool wifiDisconnesso : 1;
+  bool wifiDebole : 1;      // WiFi debole (RSSI basso).
+  bool wifiDisconnesso : 1; // WiFi non connesso.
 
-  // Telegram
-  bool telegramIrraggiungibile : 1;
+  bool telegramIrraggiungibile : 1; // Telegram offline/backoff/fallimenti.
 
-  // Memoria
-  bool memoriaInsufficiente : 1;
-  uint16_t heapFreeKB;
-  uint16_t heapLargestKB;
+  bool memoriaInsufficiente : 1; // Heap sotto soglia.
+  uint16_t heapFreeKB;           // Heap libera (KB).
+  uint16_t heapLargestKB;        // Largest free block (KB).
 
-  // Motori
-  bool motore1AttivoTroppoTempo : 1;
-  bool motore2AttivoTroppoTempo : 1;
+  bool motore1AttivoTroppoTempo : 1; // Motore 1 oltre MAX_MOTOR_SECONDS.
+  bool motore2AttivoTroppoTempo : 1; // Motore 2 oltre MAX_MOTOR_SECONDS.
 
-  // Irrigazioni
-  bool irrigazioniTroppoFrequenti : 1;
+  bool irrigazioniTroppoFrequenti : 1; // Flag “troppo frequente” (se usato nei controlli).
 
-  uint8_t irrigazioniOggiMot1;
-  uint8_t irrigazioniOggiMot2;
+  uint8_t irrigazioniOggiMot1; // Conteggio irrigazioni oggi (motore 1).
+  uint8_t irrigazioniOggiMot2; // Conteggio irrigazioni oggi (motore 2).
 
-  unsigned long lastIrrMot1;
-  unsigned long lastIrrMot2;
+  unsigned long lastIrrMot1; // millis() ultima irrigazione motore 1.
+  unsigned long lastIrrMot2; // millis() ultima irrigazione motore 2.
 
-  // Valori (solo quelli necessari)
-  int8_t rssi; // potenza segnale wifi
-  float temperaturaESP32;
-  uint16_t spiffsFreeKB;
-  uint8_t irrigazioniOggi;
+  int8_t rssi;             // RSSI WiFi in dBm.
+  float temperaturaESP32;  // Temperatura ESP32 (°C).
+  uint16_t spiffsFreeKB;   // Spazio libero SPIFFS (KB).
+  uint8_t irrigazioniOggi; // Totale/placeholder (se lo usi come aggregato).
 
-  // Timestamp ottimizzati (usa solo quando serve)
-  unsigned long lastSensorCheck;
-  unsigned long lastTempCheck;
-  unsigned long lastWifiCheck;
-  unsigned long lastMemoryCheck;
-  unsigned long lastIrrigationTime;
-  unsigned long lastDayReset;
-  unsigned long motore1StartTime;
-  unsigned long motore2StartTime;
-  unsigned long lastSuccessfulTelegramComm;
+  unsigned long lastSensorCheck;            // millis() ultimo check sensori.
+  unsigned long lastTempCheck;              // millis() ultimo check temperatura.
+  unsigned long lastWifiCheck;              // millis() ultimo check WiFi.
+  unsigned long lastMemoryCheck;            // millis() ultimo check memoria.
+  unsigned long lastIrrigationTime;         // millis() ultima irrigazione (generale).
+  unsigned long lastDayReset;               // Marker day-id/ultimo reset giornaliero.
+  unsigned long motore1StartTime;           // millis() inizio motore 1 (runtime).
+  unsigned long motore2StartTime;           // millis() inizio motore 2 (runtime).
+  unsigned long lastSuccessfulTelegramComm; // millis() ultima comm Telegram OK.
 };
 
-SystemHealth health = {0};
-
-const int8_t RSSI_DEBOLE = -75;
-const int8_t RSSI_CRITICO = -85;
-const float TEMP_WARNING = 75.0;
-const float TEMP_CRITICAL = 85.0;
-const uint8_t UMIDITA_CRITICA = 15;
-const uint16_t MAX_MOTOR_SECONDS = 600;   // 10 min in secondi
-const uint32_t MIN_IRRIGATION_MS = 30000; // 1 ore 3600000UL
-const uint8_t MAX_IRRIGATIONS_DAY = 10;
-const uint16_t MIN_FREE_KB = 50;
-const uint16_t SENSOR_LOW = 500;
-const uint16_t SENSOR_HIGH = 4000;
-RTC_DATA_ATTR uint32_t bootCounter = 0;
-
-// Intervalli check (ottimizzati)
-const uint8_t CHECK_TEMP = 30UL;
-const uint8_t CHECK_WIFI = 10UL;
-const uint16_t CHECK_MEMORY = 300UL;
-const uint8_t CHECK_MOTOR = 5UL;
-const uint8_t CHECK_TELEGRAM = 60UL;
-const uint8_t CHECK_SENS = 20UL;
-
-
-// variabili per irrigazione automatica
 struct AutoZone
 {
-  bool active = false;  // true = sto irrigando questo vaso in AUTO
-  uint8_t startTh = 25; // start: sotto a questo -> accendo
-  uint8_t stopTh = 30;  // stop: sopra a questo -> spengo
+  bool active = false;  // True se AUTO ha avviato irrigazione (zona “attiva”).
+  uint8_t startTh = 25; // %: sotto/uguale -> avvia.
+  uint8_t stopTh = 30;  // %: sopra/uguale -> ferma.
 };
 
-AutoZone az1, az2;
-bool autoEnabled = true;
-
-// Dati WiFi
-const char *ssid = SECRET_WIFI_SSID;
-const char *password = SECRET_WIFI_PASS;
-
-// Configurazione Meteo
-String openWeatherMapApiKey = SECRET_API_OPENWEATHER;
-String city = "Vernasca,IT"; // Città
-
-// Token del bot Telegram e chat ID
-#define BOTtoken SECRET_BOT_TOKEN
-#define CHAT_ID SECRET_CHAT_ID
-
-// avvio bot telegram
-WiFiClientSecure client;
-UniversalTelegramBot bot(BOTtoken, client);
-
-// Avvio di Telnet
-WiFiServer telnetServer(23); // Porta Telnet
-WiFiClient telnetClient;
-String telnetLine; // buffer comando telnet
-
-// Variabili per bot telegram
-int botRequestDelay = 3000;       // Tempo minimo tra due controlli per nuovi messaggi da Telegram
-unsigned long lastTimeBotRan = 0; // Memorizza l’ultima volta in cui il bot ha controllato nuovi messaggi
-unsigned long lastTelegramMs = 0;
-const unsigned long TELEGRAM_MIN_INTERVAL_MS = 1200; // ~1 msg/sec prudente
-long lastHandledUpdateId = 0;
-unsigned long lastMotorCommandTime = 0;
-const unsigned long MOTOR_DEBOUNCE_INTERVAL = 2000; // 2 secondi tra comandi
-bool motorOperationInProgress = false;
-static uint32_t stateTimeoutMs = 0;
-const uint32_t STATE_TIMEOUT_WINDOW_MS = 30000UL; // tempo di timeout per mancata risposta nel accensione motori manualmente
-
-// Variabili motori
-unsigned long offTimeMot1 = 0;
-unsigned long offTimeMot2 = 0;
-
-// inizializzo varibili per debug e manutenzione
-bool manutenzione = false;
-bool debug = false;
-
-// satistiche giornaliere
 struct DailyStats
 {
-  // log
-  uint16_t warnCount = 0;
-  uint16_t errCount = 0;
+  uint16_t warnCount = 0; // Warning accumulati oggi.
+  uint16_t errCount = 0;  // Errori accumulati oggi.
 
-  // umidità (sensore 1 e 2)
-  uint16_t humMin1 = 101, humMax1 = 0;
-  uint32_t humSum1 = 0;
-  uint16_t humN1 = 0;
+  uint16_t humMin1 = 101, humMax1 = 0; // Min/max umidità % vaso 1.
+  uint32_t humSum1 = 0;                // Somma umidità % vaso 1 (media).
+  uint16_t humN1 = 0;                  // Numero campioni vaso 1.
 
-  uint16_t humMin2 = 101, humMax2 = 0;
-  uint32_t humSum2 = 0;
-  uint16_t humN2 = 0;
+  uint16_t humMin2 = 101, humMax2 = 0; // Min/max umidità % vaso 2.
+  uint32_t humSum2 = 0;                // Somma umidità % vaso 2.
+  uint16_t humN2 = 0;                  // Numero campioni vaso 2.
 
-  // irrigazioni
-  uint16_t irrCount1 = 0, irrCount2 = 0;
-  uint32_t irrSec1 = 0, irrSec2 = 0;
+  uint16_t irrCount1 = 0, irrCount2 = 0; // Numero irrigazioni oggi motore 1/2.
+  uint32_t irrSec1 = 0, irrSec2 = 0;     // Secondi irrigati oggi motore 1/2.
 
-  // blocchi irrigazione
-  uint16_t blockRain = 0, blockTooSoon = 0, blockDayLimit = 0;
+  uint16_t blockRain = 0, blockTooSoon = 0, blockDayLimit = 0; // Conteggio blocchi per causa.
 
-  // scheduler
-  uint32_t lastReportDayId = 0;
+  uint32_t lastReportDayId = 0; // DayId ultimo report notturno inviato.
 };
 
-static DailyStats stats;
+// ========================= ISTANZE / STATO RUNTIME =========================
+BotState botstate = IDLE;         // Stato bot (idle/attesa durata).
+MotorSel pendingMotor = Motore_1; // Motore selezionato, in attesa durata.
 
-static const uint8_t NIGHT_REPORT_HOUR = 3; // orario per generare il report
-static const uint8_t NIGHT_REPORT_MIN_FROM = 0;
-static const uint8_t NIGHT_REPORT_MIN_TO = 59; // intervallo di 1 ora per generarlo
+bool timeReady = false; // Ora NTP valida (per timestamp log).
+bool spiffsOK = false;  // SPIFFS montato OK.
+
+size_t logBytes = 0; // Byte già scritti nel log corrente (rotazione).
+
+DatiMeteo meteo;                             // Meteo attuale + forecast.
+bool bloccoIrrigazione = false;              // True se irrigazione bloccata (pioggia/forecast).
+unsigned long scadenzaBloccoIrrigazione = 0; // millis() scadenza blocco irrigazione.
+
+static uint32_t g_nextDayCheckMs = 0; // millis() prossimo check cambio-giorno (rate-limit).
+
+SystemHealth health = {0}; // Stato salute (flag+valori misurati).
+
+AutoZone az1, az2;       // Zone auto (vaso 1 / vaso 2).
+bool autoEnabled = true; // Abilita/disabilita AUTO globale.
+
+unsigned long offTimeMot1 = 0; // millis() spegnimento programmato motore 1 (0=spento).
+unsigned long offTimeMot2 = 0; // millis() spegnimento programmato motore 2 (0=spento).
+
+bool manutenzione = false; // Modalità manutenzione (se la usi per bypass).
+bool debug = false;        // Abilita log DEBUG_L.
+
+static DailyStats stats; // Statistiche giornaliere.
+
+static const uint8_t NIGHT_REPORT_HOUR = 3;     // Ora invio report notturno.
+static const uint8_t NIGHT_REPORT_MIN_FROM = 0; // Minuto inizio finestra report.
+static const uint8_t NIGHT_REPORT_MIN_TO = 59;  // Minuto fine finestra report.
+
+// ========================= RETE / SERVIZI =========================
+const char *ssid = SECRET_WIFI_SSID;     // SSID WiFi (secrets.h).
+const char *password = SECRET_WIFI_PASS; // Password WiFi (secrets.h).
+
+String openWeatherMapApiKey = SECRET_API_OPENWEATHER; // API key OpenWeatherMap.
+String city = "Vernasca,IT";                          // Città per chiamate meteo.
+
+#define BOTtoken SECRET_BOT_TOKEN // Token bot Telegram.
+#define CHAT_ID SECRET_CHAT_ID    // Chat ID autorizzato.
+
+WiFiClientSecure client;                    // Client TLS per Telegram.
+UniversalTelegramBot bot(BOTtoken, client); // Istanza bot Telegram.
+
+WiFiServer telnetServer(23); // Server Telnet (porta 23).
+WiFiClient telnetClient;     // Client Telnet corrente.
+String telnetLine;           // Buffer riga comandi Telnet.
+
+// ========================= SCHEDULER TELEGRAM =========================
+int botRequestDelay = 3000;                          // ms tra due poll getUpdates.
+unsigned long lastTimeBotRan = 0;                    // millis() ultimo poll Telegram.
+unsigned long lastTelegramMs = 0;                    // millis() ultimo invio messaggio (anti-spam).
+const unsigned long TELEGRAM_MIN_INTERVAL_MS = 1200; // ms min tra sendMessage.
+
+long lastHandledUpdateId = 0;                       // Ultimo update_id gestito (anti-doppio).
+unsigned long lastMotorCommandTime = 0;             // millis() ultimo comando motore (debounce).
+const unsigned long MOTOR_DEBOUNCE_INTERVAL = 2000; // ms debounce pulsanti inline.
+
+bool motorOperationInProgress = false;            // True se “sessione” manuale in corso.
+static uint32_t stateTimeoutMs = 0;               // millis() scadenza attesa risposta durata.
+const uint32_t STATE_TIMEOUT_WINDOW_MS = 30000UL; // ms timeout scelta durata.
 
 // Prototipi di log
 String getTime();
@@ -295,6 +288,12 @@ void attivoBloccoPioggia();
 void controlloBloccoPioggia();
 bool irrigazioneConsentita();
 void handleMeteo();
+
+// previsioni ore successive
+bool rilevoForecastPioggia();
+bool validitaCacheForecast();
+bool aggiornamentoForecastServe(bool forza = false);
+void applicaBloccoDaForecast();
 
 // check sistem Health
 void validazioneSensori(int raw1, int raw2);
@@ -472,7 +471,7 @@ void loop()
   }
 
   // elimina i messaggi
-  //processDeleteQueue();
+  // processDeleteQueue();
 }
 
 // Funzioni di log
@@ -1285,8 +1284,16 @@ void handleMessage(String text, String chatId, String messageId)
   else if (text == "/updatemeteo")
   {
     meteo.datiValidi = false;
-    bool ok = rilevoMeteo();
-    bot.sendMessage(CHAT_ID, ok ? "Aggiornamento meteo OK." : "Aggiornamento meteo FALLITO.", "");
+    meteo.forecastValidi = false;
+
+    bool ok1 = rilevoMeteo();
+    bool ok2 = rilevoForecastPioggia();
+    if (ok2)
+      applicaBloccoDaForecast();
+
+    bot.sendMessage(CHAT_ID,
+                    (ok1 && ok2) ? "Aggiornamento meteo+forecast OK." : (ok1 ? "Meteo OK, forecast FALLITO." : "Aggiornamento meteo FALLITO."),
+                    "");
   }
   else if (text == "/sensore")
   {
@@ -1444,7 +1451,8 @@ void controlloBloccoPioggia()
 {
   if (!bloccoIrrigazione)
     return;
-  if ((uint32_t)(millis() - scadenzaBloccoIrrigazione) >= 0)
+  if (scadenzaBloccoIrrigazione != 0 &&
+      (int32_t)(millis() - scadenzaBloccoIrrigazione) >= 0)
   {
     bloccoIrrigazione = false;
     scadenzaBloccoIrrigazione = 0;
@@ -1453,6 +1461,7 @@ void controlloBloccoPioggia()
 
 bool irrigazioneConsentita()
 {
+  controlloBloccoPioggia();
   if (bloccoIrrigazione)
     return false;
   if (!meteo.datiValidi)
@@ -1465,6 +1474,8 @@ bool irrigazioneConsentita()
 void handleMeteo()
 {
   aggiornamentoMeteoServe();
+  aggiornamentoForecastServe(false);
+  applicaBloccoDaForecast();
 
   if (!meteo.datiValidi)
   {
@@ -1472,10 +1483,10 @@ void handleMeteo()
     return;
   }
 
-  unsigned long etaMin = (millis() - meteo.ultimoAggiornamento) / 60000;
+  unsigned long etaMin = (millis() - meteo.ultimoAggiornamento) / 60000UL;
 
   String msg;
-  msg.reserve(384);
+  msg.reserve(450);
   msg += "METEO " + city + "\n";
   msg += "Condizioni: " + meteo.condizioniMeteo + "\n";
   msg += "Temp: " + String(meteo.temperatura, 2) + " °C\n";
@@ -1483,14 +1494,27 @@ void handleMeteo()
   msg += "Pioggia 1h: " + String(meteo.pioggiaUltimaOra, 2) + " mm\n";
   msg += "Aggiornato: " + String(etaMin) + " min fa\n";
 
+  if (meteo.forecastValidi)
+  {
+    msg += "Prev 3h (>= " + String(soglia_Minima_Pioggia, 1) + "mm): ";
+    msg += (meteo.pioggiaPrevista3h ? "SI" : "NO");
+    msg += " (" + String(meteo.mmPrevisti3h, 2) + "mm)\n";
+
+    msg += "Prev 6h (>= " + String(soglia_Minima_Pioggia, 1) + "mm): ";
+    msg += (meteo.pioggiaPrevista6h ? "SI" : "NO");
+    msg += " (" + String(meteo.mmPrevisti6h, 2) + "mm)\n";
+  }
+  else
+  {
+    msg += "Previsione 3h/6h: ND\n";
+  }
+
   if (bloccoIrrigazione)
   {
-    uint32_t elapsed = (uint32_t)(millis() - scadenzaBloccoIrrigazione);
-    if (elapsed < 0)
+    if ((int32_t)(millis() - scadenzaBloccoIrrigazione) < 0)
     {
       uint32_t remaining = scadenzaBloccoIrrigazione - millis();
-      uint32_t remMin = remaining / 60000UL;
-      msg += "\n⛔ Blocco irrigazione: " + String(remMin) + " min";
+      msg += "\n⛔ Blocco irrigazione: " + String(remaining / 60000UL) + " min";
     }
     else
     {
@@ -1499,6 +1523,144 @@ void handleMeteo()
   }
 
   bot.sendMessage(CHAT_ID, msg, "");
+}
+
+// previsioni ore successive
+
+static inline bool isRainLike(float mm3h, const String &main)
+{
+  // Soglia principale: mm negli ultimi 3h previsti
+  if (mm3h >= soglia_Minima_Pioggia)
+    return true;
+  // Fallback (utile quando "rain.3h" non c'è ma la condizione è Rain/Drizzle)
+  if (main == "Rain" || main == "Drizzle")
+    return true;
+  return false;
+}
+
+bool validitaCacheForecast()
+{
+  if (!meteo.forecastValidi)
+    return false;
+  return (millis() - meteo.ultimoAggForecast) < durataCacheForecast;
+}
+
+bool aggiornamentoForecastServe(bool forza)
+{
+  if (forza || !validitaCacheForecast())
+  {
+    return rilevoForecastPioggia();
+  }
+  return true;
+}
+
+bool rilevoForecastPioggia()
+{
+  if (WiFi.status() != WL_CONNECTED)
+    return false;
+
+  // Richiesta forecast: prendo pochi timestamp (cnt=3) per coprire fino a ~6-9 ore
+  // OpenWeatherMap supporta cnt per limitare il numero di elementi in "list". [page:0]
+  String url;
+  url.reserve(256);
+  url = "http://api.openweathermap.org/data/2.5/forecast?q=" + city +
+        "&appid=" + openWeatherMapApiKey + "&units=metric&lang=it&cnt=3";
+
+  HTTPClient http;
+  http.setTimeout(5000);
+  http.begin(url);
+  int httpCode = http.GET();
+  if (httpCode != 200)
+  {
+    http.end();
+    logLine(ERROR_L, "Forecast HTTP error " + String(httpCode), true, false);
+    return false;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  if (!stream)
+  {
+    http.end();
+    logLine(ERROR_L, "Forecast stream non disponibile", true, false);
+    return false;
+  }
+
+  // Filtro ArduinoJson: estrai solo ciò che serve (dt, main, rain.3h) sui primi 3 slot
+  JsonDocument filter;
+  for (int i = 0; i < 3; i++)
+  {
+    filter["list"][i]["dt"] = true;
+    filter["list"][i]["weather"][0]["main"] = true;
+    filter["list"][i]["rain"]["3h"] = true;
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, *stream, DeserializationOption::Filter(filter));
+  http.end();
+  if (err)
+  {
+    logLine(ERROR_L, "Forecast JSON error " + String(err.c_str()), true, false);
+    return false;
+  }
+
+  // Reset valori forecast
+  meteo.pioggiaPrevista3h = false;
+  meteo.pioggiaPrevista6h = false;
+  meteo.mmPrevisti3h = 0.0f;
+  meteo.mmPrevisti6h = 0.0f;
+
+  const time_t nowUtc = time(nullptr); // hai già NTP in setup() [file:603]
+  const long T3 = 3L * 3600L;
+  const long T6 = 6L * 3600L;
+
+  JsonArray list = doc["list"].as<JsonArray>();
+  for (JsonObject item : list)
+  {
+    const long dt = item["dt"] | 0;
+    const long delta = dt - (long)nowUtc;
+    if (delta <= 0)
+      continue; // slot già passato
+
+    const String main = item["weather"][0]["main"] | "";
+    const float r3h = item["rain"]["3h"] | 0.0f;
+
+    const bool rainLike = isRainLike(r3h, main);
+
+    if (delta <= T3)
+    {
+      meteo.pioggiaPrevista3h = meteo.pioggiaPrevista3h || rainLike;
+      meteo.mmPrevisti3h += r3h;
+    }
+    if (delta <= T6)
+    {
+      meteo.pioggiaPrevista6h = meteo.pioggiaPrevista6h || rainLike;
+      meteo.mmPrevisti6h += r3h;
+    }
+  }
+
+  meteo.forecastValidi = true;
+  meteo.ultimoAggForecast = millis();
+  return true;
+}
+
+void applicaBloccoDaForecast()
+{
+  controlloBloccoPioggia(); // se era scaduto lo pulisce [file:603]
+  if (!meteo.forecastValidi)
+    return;
+
+  // Se pioggia prevista entro 3h o 6h, attiva blocco fino a fine finestra
+  unsigned long durataMs = 0;
+  if (meteo.pioggiaPrevista3h)
+    durataMs = 3UL * 60UL * 60UL * 1000UL;
+  else if (meteo.pioggiaPrevista6h)
+    durataMs = 6UL * 60UL * 60UL * 1000UL;
+
+  if (durataMs > 0)
+  {
+    bloccoIrrigazione = true;
+    scadenzaBloccoIrrigazione = millis() + durataMs;
+  }
 }
 
 // check sistem Health
@@ -1986,7 +2148,7 @@ static bool checkOneMotorGate(uint8_t mot, uint32_t nowMs, IrrigationBlockReason
     return false;
   }
 
-  // minimo distacco per-motore (overflow-safe con now-last) [web:1][web:28]
+  // minimo distacco per-motore (overflow-safe con now-last)
   const unsigned long last = lastIrrRef(mot);
   if (last != 0 && (uint32_t)(nowMs - (uint32_t)last) < MIN_IRRIGATION_MS)
   {
@@ -2240,8 +2402,6 @@ static inline void resetDailyStats()
 crear ciclo di controllo
 
 rifare meteo che blocca quando non deve
-
-sistemare warning json
 
 Creare controllo livello acqua
 
