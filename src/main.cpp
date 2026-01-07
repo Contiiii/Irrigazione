@@ -1,4 +1,4 @@
-// corretto bug che spammava log e alert, implementato blocco se motore acceso per troppo tempo, sbloccabile con /sblocca1 o 2, cambiato sistema per gestione telegram
+// aggiunto log quando cambia polling adattivo, aggiunto polling in health, inizio ottimizzazione funzioni fino a check sistem
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -161,10 +161,13 @@ struct SystemHealth
   unsigned long lastWifiCheck;              // millis() ultimo check WiFi.
   unsigned long lastMemoryCheck;            // millis() ultimo check memoria.
   unsigned long lastIrrigationTime;         // millis() ultima irrigazione (generale).
-  unsigned long lastDayReset;               // Marker day-id/ultimo reset giornaliero.
+  uint32_t lastDayReset;                    // Marker day-id/ultimo reset giornaliero.
   unsigned long motore1StartTime;           // millis() inizio motore 1 (runtime).
   unsigned long motore2StartTime;           // millis() inizio motore 2 (runtime).
   unsigned long lastSuccessfulTelegramComm; // millis() ultima comm Telegram OK.
+
+  uint32_t pollDelayMs; // delay corrente
+  bool pollBoostActive; // true se sei in boost
 };
 
 struct AutoZone
@@ -353,7 +356,7 @@ static void resetDailyStats();
 // helper per polling e wifi sleep mode adattivi
 static inline bool isNightHour(int h);
 static inline void boostPolling(uint32_t ms);
-static inline uint32_t currentPollDelayMs(int hourNow);
+static inline uint32_t currentPollDelayMs(int hourNow, uint32_t nowMs);
 static inline void wifiFollowPolling(uint32_t nowMs, uint32_t delayMs);
 static inline bool isBoostedNow(uint32_t nowMs);
 static inline bool motorsOnNow();
@@ -413,7 +416,6 @@ void setup()
 
   // Messaggio di avvio
   tgSend("BOT ATTIVO " + WiFi.macAddress() + " boot#" + String(bootCounter));
-  // bot.sendMessage(CHAT_ID, "BOT ATTIVO " + WiFi.macAddress() + " boot#" + String(bootCounter), "");
 
   // Avvio modalita OTA
   ArduinoOTA.setHostname("esp32-ota");
@@ -446,39 +448,38 @@ void loop()
   static int hourNow = 12;
 
   // Spegnimenti motori (evento urgente) + BLOCCO SICUREZZA al timeout
-if (offTimeMot1 && (int32_t)(now - offTimeMot1) >= 0)
-{
-  uint32_t runS = 0;
-  if (health.motore1StartTime != 0)
-    runS = (now - health.motore1StartTime) / 1000UL;
-
-  spegniMotori(1);
-
-  // Se è arrivato al limite, blocca finché non fai sblocca1
-  if (runS >= MAX_MOTOR_SECONDS && !health.motore1BloccatoSicurezza)
+  if (offTimeMot1 && (int32_t)(now - offTimeMot1) >= 0)
   {
-    health.motore1BloccatoSicurezza = true;
-    health.motore1AttivoTroppoTempo = true;
-    logLine(ERROR_L, "🚨🚫 MOTORE 1 BLOCCATO (timeout) - Usa sblocca1", true, true);
+    uint32_t runS = 0;
+    if (health.motore1StartTime != 0)
+      runS = (now - health.motore1StartTime) / 1000UL;
+
+    spegniMotori(1);
+
+    // Se è arrivato al limite, blocca finché non fai sblocca1
+    if (runS >= MAX_MOTOR_SECONDS && !health.motore1BloccatoSicurezza)
+    {
+      health.motore1BloccatoSicurezza = true;
+      health.motore1AttivoTroppoTempo = true;
+      logLine(ERROR_L, "🚨🚫 MOTORE 1 BLOCCATO (timeout) - Usa sblocca1", true, true);
+    }
   }
-}
 
-if (offTimeMot2 && (int32_t)(now - offTimeMot2) >= 0)
-{
-  uint32_t runS = 0;
-  if (health.motore2StartTime != 0)
-    runS = (now - health.motore2StartTime) / 1000UL;
-
-  spegniMotori(2);
-
-  if (runS >= MAX_MOTOR_SECONDS && !health.motore2BloccatoSicurezza)
+  if (offTimeMot2 && (int32_t)(now - offTimeMot2) >= 0)
   {
-    health.motore2BloccatoSicurezza = true;
-    health.motore2AttivoTroppoTempo = true;
-    logLine(ERROR_L, "🚨🚫 MOTORE 2 BLOCCATO (timeout) - Usa sblocca2", true, true);
-  }
-}
+    uint32_t runS = 0;
+    if (health.motore2StartTime != 0)
+      runS = (now - health.motore2StartTime) / 1000UL;
 
+    spegniMotori(2);
+
+    if (runS >= MAX_MOTOR_SECONDS && !health.motore2BloccatoSicurezza)
+    {
+      health.motore2BloccatoSicurezza = true;
+      health.motore2AttivoTroppoTempo = true;
+      logLine(ERROR_L, "🚨🚫 MOTORE 2 BLOCCATO (timeout) - Usa sblocca2", true, true);
+    }
+  }
 
   // Telnet: puoi farlo ogni giro o ogni 10–20ms se vuoi alleggerire
   handleTelnet();
@@ -496,7 +497,6 @@ if (offTimeMot2 && (int32_t)(now - offTimeMot2) >= 0)
   {
     resetAskSession();
     tgSend("Richiesta scaduta");
-    // bot.sendMessage(CHAT_ID, "Richiesta scaduta", "");
   }
 
   // Sensori ogni CHECK_SENS secondi
@@ -516,8 +516,19 @@ if (offTimeMot2 && (int32_t)(now - offTimeMot2) >= 0)
   }
 
   // --- Polling Telegram ---
-  uint32_t delayMs = currentPollDelayMs(hourNow);
+  uint32_t delayMs = currentPollDelayMs(hourNow, now);
   wifiFollowPolling(now, delayMs);
+
+  health.pollDelayMs = delayMs;
+  health.pollBoostActive = isBoostedNow(now);
+
+  // debug polling
+  static uint32_t lastDelayMs = 0;
+  if (delayMs != lastDelayMs)
+  {
+    logLine(INFO, String("POLL cambia: ") + String(lastDelayMs) + " -> " + String(delayMs) + " ms (boost=" + String(isBoostedNow(now) ? "⚡ON" : "🐌OFF") + ", hour=" + String(hourNow) + ")", true, false);
+    lastDelayMs = delayMs;
+  }
 
   if ((int32_t)(now - nextPollMs) >= 0)
   {
@@ -818,7 +829,7 @@ void handleTelnet()
       if (telnetClient && telnetClient.connected())
         telnetClient.stop();
       telnetClient = newClient;
-      telnetClient.println("Telnet OK. Comandi: tail, alert, clear, size");
+      telnetClient.println("Telnet OK. Comandi: tail, alert, clear, size, tgreset, health");
       telnetWelcome();
     }
   }
@@ -885,10 +896,23 @@ void handleTelnetCommand(const String &cmd)
       n = 50;
     telnetSendTail("/log.txt", n);
   }
+  else if (cmd == "tgreset")
+  {
+    lastHandledUpdateId = 0;
+    lastHandledUpdateIdRTC = 0;
+    tgBusy = false;
+    client.stop();
+    telnetClient.println("OK - Telegram offset reset to 0");
+  }
   else if (cmd == "clear")
   {
     SPIFFS.remove("/log.txt");
     telnetClient.println("OK cleared.");
+  }
+  else if (cmd == "health")
+  {
+    handleHealth();
+    return;
   }
   else if (cmd == "size")
   {
@@ -907,7 +931,7 @@ void handleTelnetCommand(const String &cmd)
   }
   else
   {
-    telnetClient.println("Comandi: tail, alert, clear, size");
+    telnetClient.println("Comandi: tail, alert, clear, size, tgreset, health");
   }
 }
 
@@ -1263,11 +1287,11 @@ void askTime(const String &who)
 {
   String keyboardJson = F(
       "[["
-      "{\"text\":\"10s\",\"callback_data\":\"t_10\"},"
-      "{\"text\":\"30s\",\"callback_data\":\"t_30\"}"
+      "{\"text\":\"⏱️10s\",\"callback_data\":\"t_10\"},"
+      "{\"text\":\"⏱️30s\",\"callback_data\":\"t_30\"}"
       "],"
       "["
-      "{\"text\":\"60s\",\"callback_data\":\"t_60\"}"
+      "{\"text\":\"⏱️60s\",\"callback_data\":\"t_60\"}"
       "]]");
 
   bot.sendMessageWithInlineKeyboard(
@@ -1381,7 +1405,6 @@ void handleCallBack(String text, String chatId, String messageId)
     else
     {
       tgSend("Tempo non valido.");
-      // bot.sendMessage(CHAT_ID, "Tempo non valido.", "");
       resetAskSession();
       botstate = IDLE;
       motorOperationInProgress = false;
@@ -1398,16 +1421,12 @@ void handleCallBack(String text, String chatId, String messageId)
     {
       if (rr == IRR_TOO_SOON)
         tgSend("⏳ Motore " + motorLabel(motB) + ": attendi ~" + String(waitM) + " min");
-      // bot.sendMessage(CHAT_ID, "⏳ Motore " + motorLabel(motB) + ": attendi ~" + String(waitM) + " min", "");
       else if (rr == IRR_DAY_LIMIT)
         tgSend("🚫 Motore " + motorLabel(motB) + ": limite 10/giorno raggiunto");
-      // bot.sendMessage(CHAT_ID, "🚫 Motore " + motorLabel(motB) + ": limite 10/giorno raggiunto", "");
       else if (rr == IRR_RAIN_BLOCK)
         tgSend("🌧️ Irrigazione bloccata (pioggia/blocco)");
-      // bot.sendMessage(CHAT_ID, "🌧️ Irrigazione bloccata (pioggia/blocco)", "");
       else if (rr == IRR_MOTOR_LOCKED)
         tgSend("🚫 Motore " + motorLabel(motB) + " BLOCCATO SICUREZZA. Usa /sblocca" + motorLabel(motB));
-      // bot.sendMessage(CHAT_ID, "Irrigazione bloccata.", "");
       else
         tgSend("Irrigazione bloccata.");
 
@@ -1512,7 +1531,6 @@ void handleMessage(String text, String chatId, String messageId)
         msg += " (restano " + String((uint32_t)remMs / 1000UL) + "s)";
     }
     tgSend(msg);
-    // bot.sendMessage(CHAT_ID, msg, "");
     return;
   }
   else if (text == "/accendimotori")
@@ -1560,7 +1578,6 @@ void handleMessage(String text, String chatId, String messageId)
     health.motore1AttivoTroppoTempo = false; // reset allarme runtime
     az1.active = false;                      // riallinea auto
     tgSend("🔓 Motore 1 sbloccato.");
-    // bot.sendMessage(CHAT_ID, "🔓 Motore 1 sbloccato.", "");
     logLine(INFO, "🔓 Motore 1 sbloccato manualmente", true, true);
     return;
   }
@@ -1570,7 +1587,6 @@ void handleMessage(String text, String chatId, String messageId)
     health.motore2AttivoTroppoTempo = false; // reset allarme runtime
     az2.active = false;                      // riallinea auto
     tgSend("🔓 Motore 2 sbloccato.");
-    // bot.sendMessage(CHAT_ID, "🔓 Motore 2 sbloccato.", "");
     logLine(INFO, "🔓 Motore 2 sbloccato manualmente", true, true);
     return;
   }
@@ -1583,7 +1599,6 @@ void handleMessage(String text, String chatId, String messageId)
     az1.active = false;
     az2.active = false;
     tgSend("🔓 Motori sbloccati.");
-    // bot.sendMessage(CHAT_ID, "🔓 Motori sbloccati.", "");
     logLine(INFO, "🔓 Motori sbloccati manualmente", true, true);
     return;
   }
@@ -1596,6 +1611,9 @@ void handleMessage(String text, String chatId, String messageId)
   }
   if (text == "/updatemeteo")
   {
+    meteo.datiValidi = false;
+    bool ok = rilevoMeteo();
+    tgSend(ok ? "Aggiornamento meteo OK." : "Aggiornamento meteo FALLITO.");
     return;
   }
   if (text == "/sensore")
@@ -1611,7 +1629,6 @@ void handleMessage(String text, String chatId, String messageId)
   if (text == "/alert")
   {
     tgSend(tailWarnError(20, true));
-    // bot.sendMessage(CHAT_ID, tailWarnError(20, true));
     return;
   }
   if (text == "/health")
@@ -1622,14 +1639,12 @@ void handleMessage(String text, String chatId, String messageId)
   if (text == "/log")
   {
     tgSend(tailLog(20));
-    // bot.sendMessage(CHAT_ID, tailLog(20));
     return;
   }
   if (text == "/clearlog")
   {
     SPIFFS.remove("/log.txt");
     tgSend("Log cancellato.");
-    // bot.sendMessage(CHAT_ID, "Log cancellato.", "");
     return;
   }
 
@@ -2103,6 +2118,11 @@ void handleHealth()
     safePrintf(" fa)");
   }
 
+  // polling telegram
+  safePrintf("\n⏱️ Polling TG: %lu ms | %s",
+             (unsigned long)health.pollDelayMs,
+             health.pollBoostActive ? "⚡ BOOST" : "🐌 BASE");
+
   // Blocco pioggia / AUTO
   safePrintf("\n\n🌧️ Blocco irrigazione: ");
   if (!bloccoIrrigazione)
@@ -2180,6 +2200,7 @@ void validazioneSensori(int raw1, int raw2)
 {
   static bool lastSensor1Error = false;
   static bool lastSensor2Error = false;
+  static const int WET_ADC = 1050, DRY_ADC = 3300; // ← costanti
 
   // Sensore 1
   bool sensor1Error = (raw1 < SENSOR_LOW || raw1 > SENSOR_HIGH);
@@ -2215,8 +2236,8 @@ void validazioneSensori(int raw1, int raw2)
   // check umidita critica
   if (!sensor1Error && !sensor2Error)
   {
-    int pct1 = map(constrain(raw1, 1050, 3300), 3300, 1050, 0, 100);
-    int pct2 = map(constrain(raw2, 1050, 3300), 3300, 1050, 0, 100);
+    int pct1 = map(constrain(raw1, WET_ADC, DRY_ADC), DRY_ADC, WET_ADC, 0, 100);
+    int pct2 = map(constrain(raw2, WET_ADC, DRY_ADC), DRY_ADC, WET_ADC, 0, 100);
 
     // Umidità sotto 15% su ALMENO UN sensore? → CRITICA
     bool critica = (pct1 < UMIDITA_CRITICA || pct2 < UMIDITA_CRITICA);
@@ -2565,56 +2586,80 @@ uint32_t computeDayId()
 
 void dailyResetTick(uint32_t nowMs)
 {
+  // Rate-limit: esegui al massimo 1 volta/minuto (overflow-safe)
   if ((int32_t)(nowMs - g_nextDayCheckMs) < 0)
     return;
-  g_nextDayCheckMs = nowMs + 60000UL; // 1 volta/minuto
+  g_nextDayCheckMs = nowMs + 60000UL;
 
   const uint32_t dayId = computeDayId();
   if (dayId == 0)
     return;
 
-  if ((uint32_t)health.lastDayReset != dayId)
-  {
-    health.lastDayReset = (unsigned long)dayId;
-    health.irrigazioniOggiMot1 = 0;
-    health.irrigazioniOggiMot2 = 0;
-    logLine(INFO, "🔄🚿 Reset conteggi irrigazioni giornaliere (per motore)", true, false);
-  }
+  if ((uint32_t)health.lastDayReset == dayId)
+    return;
+
+  health.lastDayReset = (unsigned long)dayId;
+  health.irrigazioniOggiMot1 = 0;
+  health.irrigazioniOggiMot2 = 0;
+
+  logLine(INFO, "🔄🚿 Reset conteggi irrigazioni giornaliere (per motore)", true, false);
 }
 
 static inline bool motorIsOn(uint8_t mot)
 {
-  return (mot == 1) ? (offTimeMot1 != 0) : (offTimeMot2 != 0);
+  if (mot == 1)
+    return offTimeMot1 != 0;
+  if (mot == 2)
+    return offTimeMot2 != 0;
+  return false;
 }
 
-static inline uint8_t &todayCountRef(uint8_t mot)
+static inline uint8_t *todayCountPtr(uint8_t mot)
 {
-  return (mot == 1) ? health.irrigazioniOggiMot1 : health.irrigazioniOggiMot2;
+  if (mot == 1)
+    return &health.irrigazioniOggiMot1;
+  if (mot == 2)
+    return &health.irrigazioniOggiMot2;
+  return nullptr;
 }
 
-static inline unsigned long &lastIrrRef(uint8_t mot)
+static inline unsigned long *lastIrrPtr(uint8_t mot)
 {
-  return (mot == 1) ? health.lastIrrMot1 : health.lastIrrMot2;
+  if (mot == 1)
+    return &health.lastIrrMot1;
+  if (mot == 2)
+    return &health.lastIrrMot2;
+  return nullptr;
 }
 
 static bool checkOneMotorGate(uint8_t mot, uint32_t nowMs, IrrigationBlockReason &reason, uint16_t &waitMin)
 {
   waitMin = 0;
 
-  // limite per-motore al giorno
-  if (todayCountRef(mot) >= MAX_IRRIGATIONS_DAY)
+  uint8_t *todayCnt = todayCountPtr(mot);
+  unsigned long *lastIrr = lastIrrPtr(mot);
+  if (!todayCnt || !lastIrr)
+  {
+    reason = IRR_MOTOR_LOCKED; // oppure aggiungi un reason tipo IRR_INVALID
+    return false;
+  }
+
+  if (*todayCnt >= MAX_IRRIGATIONS_DAY)
   {
     reason = IRR_DAY_LIMIT;
     return false;
   }
 
-  // minimo distacco per-motore (overflow-safe con now-last)
-  const unsigned long last = lastIrrRef(mot);
-  if (last != 0 && (uint32_t)(nowMs - (uint32_t)last) < MIN_IRRIGATION_MS)
+  const uint32_t last = (uint32_t)(*lastIrr);
+  if (last != 0 && (uint32_t)(nowMs - last) < MIN_IRRIGATIONS_DAY)
   {
     reason = IRR_TOO_SOON;
-    uint32_t remMs = MIN_IRRIGATION_MS - (uint32_t)(nowMs - (uint32_t)last);
-    waitMin = (uint16_t)(remMs / 60000UL);
+
+    const uint32_t elapsed = (uint32_t)(nowMs - last);
+    const uint32_t remMs = MIN_IRRIGATION_MS - elapsed;
+
+    // Arrotonda per eccesso: 1..60000ms => 1 minuto
+    waitMin = (uint16_t)((remMs + 60000UL - 1) / 60000UL);
     return false;
   }
 
@@ -2623,6 +2668,21 @@ static bool checkOneMotorGate(uint8_t mot, uint32_t nowMs, IrrigationBlockReason
 
 bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, IrrigationBlockReason &reason, uint8_t &motBlocked, uint16_t &waitMin, bool ignoreMeteo)
 {
+  // Normalizza parametri di uscita
+  reason = IRR_OK;
+  motBlocked = 0;
+  waitMin = 0;
+
+  // Validazione base
+  if (seconds == 0)
+  {
+    return false; // Nessuna irrigazione richiesta
+  }
+  if (seconds > MAX_MOTOR_SECONDS)
+  {
+    seconds = MAX_MOTOR_SECONDS; // Fail-safe
+  }
+
   // Blocchi sicurezza motori (persistenti finché non fai /sbloccaX)
   if ((m == Motore_1 || m == Entrambi_i_Motori) && health.motore1BloccatoSicurezza)
   {
@@ -2637,15 +2697,13 @@ bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, Irrigat
     return false;
   }
 
+  // Boost reattività polling/wifi durante richiesta irrigazione
   boostPolling(BOOST_IRR_MS);
+
   const uint32_t now = millis();
   dailyResetTick(now);
 
-  reason = IRR_OK;
-  motBlocked = 0;
-  waitMin = 0;
-
-  // Rispetta pioggia/blocco anche in manuale (se vuoi bypass manuale dimmelo)
+  // Rispetta pioggia/blocco anche in manuale (se vuoi bypass manuale usa ignoreMeteo=true)
   if (!irrigazioneConsentita() && !ignoreMeteo)
   {
     reason = IRR_RAIN_BLOCK;
@@ -2653,7 +2711,7 @@ bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, Irrigat
     return false;
   }
 
-  // Quali motori sto davvero avviando ORA? (se già ON non conto e non applico “gap”)
+  // Quali motori sto davvero avviando ORA? (se già ON non conto e non applico "gap")
   const bool start1 = (m == Motore_1 || m == Entrambi_i_Motori) && !motorIsOn(1);
   const bool start2 = (m == Motore_2 || m == Entrambi_i_Motori) && !motorIsOn(2);
 
@@ -2687,31 +2745,42 @@ bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, Irrigat
   accendiMotori((int)m, (int)seconds);
 
   // Aggiorno contatori solo per i motori realmente partiti da OFF
+  // Usa i tuoi helper con POINTER (*todayCnt)
   if (start1)
   {
-    todayCountRef(1)++;
-    lastIrrRef(1) = now;
-  }
-  if (start2)
-  {
-    todayCountRef(2)++;
-    lastIrrRef(2) = now;
-  }
-
-  // contatori per report notturno
-  if (start1)
-  {
+    uint8_t *todayCnt1 = todayCountPtr(1);
+    unsigned long *lastIrr1 = lastIrrPtr(1);
+    if (todayCnt1 && lastIrr1)
+    {
+      (*todayCnt1)++;
+      (*lastIrr1) = now;
+    }
     stats.irrCount1++;
     stats.irrSec1 += (uint32_t)seconds;
   }
   if (start2)
   {
+    uint8_t *todayCnt2 = todayCountPtr(2);
+    unsigned long *lastIrr2 = lastIrrPtr(2);
+    if (todayCnt2 && lastIrr2)
+    {
+      (*todayCnt2)++;
+      (*lastIrr2) = now;
+    }
     stats.irrCount2++;
     stats.irrSec2 += (uint32_t)seconds;
   }
 
-  logLine(INFO, String("🚿▶️ IRR START ") + source + " m=" + motorLabel((int)m) + " c1=" + String(health.irrigazioniOggiMot1) + " c2=" + String(health.irrigazioniOggiMot2),
-          true, true);
+  // Log compatto con buffer statico
+  {
+    char line[220];
+    snprintf(line, sizeof(line),
+             "🚿▶️ IRR START %s m=%s c1=%u c2=%u",
+             source ? source : "?", motorLabel((int)m).c_str(),
+             (unsigned)health.irrigazioniOggiMot1,
+             (unsigned)health.irrigazioniOggiMot2);
+    logLine(INFO, String(line), true, true);
+  }
 
   return true;
 }
@@ -2729,21 +2798,24 @@ static inline String umiditaStatusEmoji(int um)
   if (um < 20)
     return "🔴 CRITICA";
   if (um < 30)
-    return "🟠 BASSA";
-  if (um < 60)
+    return "🌵 BASSA";
+  if (um < 70)
     return "🟢 OTTIMALE";
-  if (um < 80)
-    return "🔵 ALTA";
   return "🟣 SATURA";
 }
 
 // statistiche giornaliere
 void nightlyReportTick(uint32_t nowMs)
 {
+  // Check periodico: normalmente 60s, ma in finestra e dopo fallimento puoi ridurre.
   static uint32_t nextCheckMs = 0;
+  static bool lastAttemptFailedInWindow = false;
+
   if ((int32_t)(nowMs - nextCheckMs) < 0)
     return;
-  nextCheckMs = nowMs + 60000UL; // ogni 60s, leggero
+
+  // Default: un check al minuto
+  nextCheckMs = nowMs + 60000UL;
 
   if (!timeReady)
     return;
@@ -2758,7 +2830,16 @@ void nightlyReportTick(uint32_t nowMs)
       (t.tm_min <= NIGHT_REPORT_MIN_TO);
 
   if (!inWindow)
+  {
+    lastAttemptFailedInWindow = false; // reset stato retry
     return;
+  }
+
+  // Se sono in finestra e l’ultimo tentativo è fallito, riprova più spesso.
+  if (lastAttemptFailedInWindow)
+  {
+    nextCheckMs = nowMs + 15000UL; // retry ogni 15s dentro la finestra
+  }
 
   const uint32_t dayId = computeDayId();
   if (dayId == 0)
@@ -2767,7 +2848,7 @@ void nightlyReportTick(uint32_t nowMs)
   if (stats.lastReportDayId == dayId)
     return; // già inviato oggi
 
-  // opzionale: evita invio mentre irriga
+  // Evita invio mentre irriga: riduce spam e migliora reattività
   if (offTimeMot1 != 0 || offTimeMot2 != 0)
     return;
 
@@ -2775,10 +2856,12 @@ void nightlyReportTick(uint32_t nowMs)
   if (ok)
   {
     resetDailyStats();
-    stats.lastReportDayId = dayId; // set dopo il reset
+    stats.lastReportDayId = dayId; // marca come inviato dopo reset
+    lastAttemptFailedInWindow = false;
   }
   else
   {
+    lastAttemptFailedInWindow = true;
     logLine(WARN, "⚠️ Report notturno NON inviato (Telegram/WiFi). Riprovo nella finestra.", true, false);
   }
 }
@@ -2787,85 +2870,138 @@ static bool sendNightlyReport()
 {
   static const size_t TG_MAX = 3900; // margine sotto 4096
 
-  String msg;
-  msg.reserve(1200);
+  // Buffer statico: niente realloc/fragmentation durante la costruzione del testo.
+  static char buf[TG_MAX + 1];
+  size_t len = 0;
+  buf[0] = '\0';
 
-  // media safe
-  const float avg1 = (stats.humN1 > 0) ? (float)stats.humSum1 / (float)stats.humN1 : -1.0f;
-  const float avg2 = (stats.humN2 > 0) ? (float)stats.humSum2 / (float)stats.humN2 : -1.0f;
+  auto safePrintf = [&](const char *fmt, ...)
+  {
+    if (len >= TG_MAX)
+      return;
 
-  msg += "REPORT NOTTURNO\n";
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(buf + len, (TG_MAX - len) + 1, fmt, args);
+    va_end(args);
 
-  msg += "Log: WARN ";
-  msg += String(stats.warnCount);
-  msg += " / ERROR ";
-  msg += String(stats.errCount);
-  msg += "\n";
+    if (written <= 0)
+      return;
 
-  msg += "Umidita P1: ";
+    // vsnprintf ritorna "quanti avrebbe scritto" -> clamp a spazio disponibile
+    size_t w = (size_t)written;
+    if (w > (TG_MAX - len))
+      w = (TG_MAX - len);
+    len += w;
+    buf[len] = '\0';
+  };
+
+  // Medie safe
+  const double avg1 = (stats.humN1 > 0) ? ((double)stats.humSum1 / (double)stats.humN1) : 0.0;
+  const double avg2 = (stats.humN2 > 0) ? ((double)stats.humSum2 / (double)stats.humN2) : 0.0;
+
+  safePrintf("REPORT NOTTURNO\n");
+  safePrintf("Log: WARN %u / ERROR %u\n", (unsigned)stats.warnCount, (unsigned)stats.errCount);
+
   if (stats.humN1 == 0)
-    msg += "ND\n";
+  {
+    safePrintf("Umidita P1: ND\n");
+  }
   else
   {
-    msg += "min ";
-    msg += String(stats.humMin1);
-    msg += " avg ";
-    msg += String(avg1, 1);
-    msg += " max ";
-    msg += String(stats.humMax1);
-    msg += "\n";
+    safePrintf("Umidita P1: min %u avg %.1f max %u\n",
+               (unsigned)stats.humMin1, avg1, (unsigned)stats.humMax1);
   }
 
-  msg += "Umidita P2: ";
   if (stats.humN2 == 0)
-    msg += "ND\n";
+  {
+    safePrintf("Umidita P2: ND\n");
+  }
   else
   {
-    msg += "min ";
-    msg += String(stats.humMin2);
-    msg += " avg ";
-    msg += String(avg2, 1);
-    msg += " max ";
-    msg += String(stats.humMax2);
-    msg += "\n";
+    safePrintf("Umidita P2: min %u avg %.1f max %u\n",
+               (unsigned)stats.humMin2, avg2, (unsigned)stats.humMax2);
   }
 
-  msg += "Irrigazioni: M1 ";
-  msg += String(stats.irrCount1);
-  msg += " (";
-  msg += String(stats.irrSec1);
-  msg += "s), M2 ";
-  msg += String(stats.irrCount2);
-  msg += " (";
-  msg += String(stats.irrSec2);
-  msg += "s)\n";
+  safePrintf("Irrigazioni: M1 %u (%lus), M2 %u (%lus)\n",
+             (unsigned)stats.irrCount1, (unsigned long)stats.irrSec1,
+             (unsigned)stats.irrCount2, (unsigned long)stats.irrSec2);
 
-  msg += "Blocchi: pioggia ";
-  msg += String(stats.blockRain);
-  msg += ", troppo presto ";
-  msg += String(stats.blockTooSoon);
-  msg += ", limite giorno ";
-  msg += String(stats.blockDayLimit);
-  msg += "\n";
+  safePrintf("Blocchi: pioggia %u, troppo presto %u, limite giorno %u\n\n",
+             (unsigned)stats.blockRain,
+             (unsigned)stats.blockTooSoon,
+             (unsigned)stats.blockDayLimit);
 
-  // ultimi warning ed errori (troncati se troppo lunghi)
-  msg += "\n";
-  String tail = tailWarnError(20, false);
-  size_t room = (msg.length() < TG_MAX) ? (TG_MAX - msg.length()) : 0;
-  if (tail.length() > room)
+  // Aggiungo ultimi warning/error con truncation pulita e nota finale.
   {
-    tail = tail.substring(0, room);
-    // opzionale: piccola nota finale (se c'è spazio)
-    if (tail.length() >= 15)
+    const String tail = tailWarnError(20, false);
+
+    const char *t = tail.c_str();
+    size_t tlen = tail.length();
+
+    const char *note = "\n...(troncato)";
+    const size_t noteLen = strlen(note);
+
+    size_t room = (len < TG_MAX) ? (TG_MAX - len) : 0;
+    if (room > 0 && tlen > 0)
     {
-      tail.remove(tail.length() - 15);
-      tail += "\n...(troncato)";
+      bool truncated = false;
+
+      size_t take = tlen;
+      if (take > room)
+      {
+        truncated = true;
+
+        // Prova a lasciare spazio per la nota finale
+        if (room > (noteLen + 1))
+        {
+          take = room - noteLen;
+        }
+        else
+        {
+          take = room; // niente spazio per nota, almeno copia quello che entra
+        }
+      }
+
+      const size_t start = len;
+      memcpy(buf + len, t, take);
+      len += take;
+      buf[len] = '\0';
+
+      if (truncated)
+      {
+        // Tronca a fine riga (se possibile) dentro al pezzo copiato
+        size_t cut = len;
+        for (size_t i = len; i > start; --i)
+        {
+          if (buf[i - 1] == '\n')
+          {
+            cut = i - 1; // taglia PRIMA del newline
+            break;
+          }
+        }
+        if (cut > start)
+        {
+          len = cut;
+          buf[len] = '\0';
+        }
+
+        // Aggiungi nota se c'è spazio
+        if ((TG_MAX - len) >= noteLen)
+        {
+          memcpy(buf + len, note, noteLen);
+          len += noteLen;
+          buf[len] = '\0';
+        }
+      }
     }
   }
-  msg += tail;
 
-  // ACK: torna true/false
-  return bot.sendMessage(CHAT_ID, msg, "");
+  // tgSend accetta String: qui fai UNA sola allocazione, a fine costruzione.
+  String out;
+  out.reserve(len + 1);
+  out = buf;
+  return tgSend(out);
 }
 
 static inline void resetDailyStats()
@@ -2874,103 +3010,111 @@ static inline void resetDailyStats()
 }
 
 // helper per polling e wifi sleep mode adattivi
-static inline bool isNightHour(int h)
+static inline bool isNightHour(int h) // Ritorna true se l'ora è nella fascia NOTTE.
 {
-  return (h < ora_Inizio_Giorno || h > ora_Fine_Giorno);
+  // Valori non validi => considera "notte"
+  if (h < 0 || h > 23)
+    return true;
+
+  const int start = ora_Inizio_Giorno;
+  const int end = ora_Fine_Giorno;
+
+  // Caso normale: giorno è [start..end]
+  if (start <= end)
+  {
+    return (h < start) || (h > end);
+  }
+
+  return (h > end) && (h < start);
 }
 
-static inline void boostPolling(uint32_t ms)
+static inline void boostPolling(uint32_t ms) // Attiva un periodo di polling "boost" (più frequente) per ms millisecondi.
 {
-  uint32_t now = millis();
-  uint32_t until = now + ms;
+  const uint32_t now = millis();
+  const uint32_t until = now + ms;
+
+  // Overflow-safe: aggiorna solo se 'until' è dopo l'attuale pollBoostUntilMs
   if ((int32_t)(until - pollBoostUntilMs) > 0)
+  {
     pollBoostUntilMs = until;
-  if ((int32_t)(now - nextPollMs) < 0)
-    nextPollMs = now;
+  }
+
+  nextPollMs = 0;
+
   nextWifiPolicyMs = 0;
 }
 
-static inline uint32_t currentPollDelayMs(int hourNow)
+static inline uint32_t currentPollDelayMs(int hourNow, uint32_t nowMs) // Restituisce il delay di polling in base all'ora e allo stato boost.
 {
-  uint32_t base = isNightHour(hourNow) ? POLL_NIGHT_MS : POLL_DAY_MS;
-  if ((int32_t)(millis() - pollBoostUntilMs) < 0)
+  const uint32_t base = isNightHour(hourNow) ? POLL_NIGHT_MS : POLL_DAY_MS;
+
+  // Se siamo ancora entro la finestra boost => usa delay più aggressivo.
+  if ((int32_t)(nowMs - pollBoostUntilMs) < 0)
+  {
     return POLL_BOOST_MS;
+  }
   return base;
 }
 
-static inline bool isBoostedNow(uint32_t nowMs)
+static inline bool isBoostedNow(uint32_t nowMs) // True se adesso (nowMs) siamo in periodo boost.
 {
   return (int32_t)(nowMs - pollBoostUntilMs) < 0;
 }
 
-static inline bool motorsOnNow()
+static inline bool motorsOnNow() // Motori ON se c'è un offTime programmato (vuol dire che sono in esecuzione).
 {
   return (offTimeMot1 != 0) || (offTimeMot2 != 0);
 }
 
-static inline bool telnetOnNow()
+static inline bool telnetOnNow() // Telnet "attivo" se c'è un client e la connessione è aperta.
 {
   return (telnetClient && telnetClient.connected());
 }
 
-static inline void wifiFollowPolling(uint32_t nowMs, uint32_t delayMs)
+static inline void wifiFollowPolling(uint32_t nowMs, uint32_t delayMs) // Allinea la policy di WiFi power-save con la frequenza di polling.
 {
-  // Evita toggle continuo
+  // Rate limit: evita toggle continui (ogni 5s massimo)
   if ((int32_t)(nowMs - nextWifiPolicyMs) < 0)
     return;
-  nextWifiPolicyMs = nowMs + 5000UL;
+  nextWifiPolicyMs = nowMs + 10000UL;
 
-  // Vincoli richiesti:
-  // - finché non ho l’ora: full
-  // - telnet connesso: full
-  // - motori ON: full
-  // - in boost: full
+  // Condizioni in cui NON vogliamo mai power-save
   const bool forceFull =
       (!timeReady) || telnetOnNow() || motorsOnNow() || isBoostedNow(nowMs);
 
-  // “polling rallentato” = stai andando in modalità notte (delay grande)
+  // Power-save solo se connesso e se "stai davvero in modalità notte"
   const bool wantPs =
       (!forceFull) &&
       (WiFi.status() == WL_CONNECTED) &&
       (delayMs >= POLL_NIGHT_MS);
 
+  // Se già nello stato desiderato, non fare nulla
   if (wantPs == wifiPsOn)
     return;
 
+  // Applica policy. (Ideale: controllare ritorno di esp_wifi_set_ps)
   if (wantPs)
   {
     WiFi.setSleep(true);
-    esp_wifi_set_ps(WIFI_PS_MIN_MODEM); // power-save moderato
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
   }
   else
   {
     WiFi.setSleep(false);
-    esp_wifi_set_ps(WIFI_PS_NONE); // full-power / bassa latenza
+    esp_wifi_set_ps(WIFI_PS_NONE);
   }
 
   wifiPsOn = wantPs;
 }
 
 /*
-quando motori accesi per troppo tempo mandare warnin e bloccare l'irrigazione per tempo finche non si controlla
-
-mettere polling ifsso a 10000 e abbassarlo a 3 solo quando arrivano messaggi
-
-inserire nei log qunado motore bloccato/sbloccato, qunado cambia polling
-
-inserire polling in health
-
 bloccare report nottturno dopo il primo
-
-quando log raggiunge 20 righe spamma
 
 Creare controllo livello acqua
 
 sistemare loop e setup
 
 Utilizzare doppio core
-
-far diminuire polling dopo i minuti
 
 yield();
 */
