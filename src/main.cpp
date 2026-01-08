@@ -1,4 +1,4 @@
-// aggiunto log quando cambia polling adattivo, aggiunto polling in health, inizio ottimizzazione funzioni fino a check sistem
+// aggiunto log quando cambia polling adattivo, aggiunto polling in health, inizio ottimizzazione funzioni fino a check sistem, modificato segnale log blocco motore ogni 20 minuti, aumentato log umidita da 10 a 20 minuti
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -68,7 +68,7 @@ const float soglia_Minima_Pioggia = 0.5f;                                  // So
 const int ora_Inizio_Giorno = 6; // Ora inizio fascia “giorno”.
 const int ora_Fine_Giorno = 23;  // Ora fine fascia “giorno”.
 
-const int8_t RSSI_DEBOLE = -75;     // Soglia RSSI “debole” (dBm).
+const int8_t RSSI_DEBOLE = -78;     // Soglia RSSI “debole” (dBm).
 const int8_t RSSI_CRITICO = -85;    // Soglia RSSI “critico” (dBm).
 const float TEMP_WARNING = 75.0f;   // Soglia warning temperatura ESP32 (°C).
 const float TEMP_CRITICAL = 85.0f;  // Soglia critica temperatura ESP32 (°C).
@@ -521,14 +521,6 @@ void loop()
 
   health.pollDelayMs = delayMs;
   health.pollBoostActive = isBoostedNow(now);
-
-  // debug polling
-  static uint32_t lastDelayMs = 0;
-  if (delayMs != lastDelayMs)
-  {
-    logLine(INFO, String("POLL cambia: ") + String(lastDelayMs) + " -> " + String(delayMs) + " ms (boost=" + String(isBoostedNow(now) ? "⚡ON" : "🐌OFF") + ", hour=" + String(hourNow) + ")", true, false);
-    lastDelayMs = delayMs;
-  }
 
   if ((int32_t)(now - nextPollMs) >= 0)
   {
@@ -1133,7 +1125,7 @@ void handleSensore(bool toTelegram)
   // cooldown log "richiesta ma bloccato"
   static uint32_t lastBlockedLog1 = 0;
   static uint32_t lastBlockedLog2 = 0;
-  const uint32_t BLOCK_LOG_COOLDOWN_MS = 10UL * 60UL * 1000UL; // 10 min
+  const uint32_t BLOCK_LOG_COOLDOWN_MS = 20UL * 60UL * 1000UL; // 10 min
 
   const bool mot1On = (offTimeMot1 != 0);
   const bool mot2On = (offTimeMot2 != 0);
@@ -1184,7 +1176,7 @@ void handleSensore(bool toTelegram)
   static int lastLoggedPct2 = -1;
   static uint32_t lastHumLogMs = 0;
 
-  const uint32_t HUM_LOG_INTERVAL_MS = 10UL * 60UL * 1000UL; // 10 min
+  const uint32_t HUM_LOG_INTERVAL_MS = 20UL * 60UL * 1000UL; // 20 min
   const int HUM_DELTA_PCT = 5;
 
   int d1 = (lastLoggedPct1 < 0) ? 999 : abs(umiditaSens1 - lastLoggedPct1);
@@ -2651,7 +2643,7 @@ static bool checkOneMotorGate(uint8_t mot, uint32_t nowMs, IrrigationBlockReason
   }
 
   const uint32_t last = (uint32_t)(*lastIrr);
-  if (last != 0 && (uint32_t)(nowMs - last) < MIN_IRRIGATIONS_DAY)
+  if (last != 0 && (uint32_t)(nowMs - last) < MIN_IRRIGATION_MS)
   {
     reason = IRR_TOO_SOON;
 
@@ -3108,13 +3100,15 @@ static inline void wifiFollowPolling(uint32_t nowMs, uint32_t delayMs) // Alline
 }
 
 /*
-bloccare report nottturno dopo il primo
-
 Creare controllo livello acqua
+
+riordinare funzione e variabili
 
 sistemare loop e setup
 
 Utilizzare doppio core
+
+watchdog, freertos
 
 yield();
 */
