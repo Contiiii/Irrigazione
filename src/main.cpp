@@ -1,4 +1,5 @@
-// aggiunto log quando cambia polling adattivo, aggiunto polling in health, inizio ottimizzazione funzioni fino a check sistem, modificato segnale log blocco motore ogni 20 minuti, aumentato log umidita da 10 a 20 minuti
+
+// modificata lettura sensori a motori accesi (3s), aggiunto blocco motori quando sensori disconnessi, modificato report notturno
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -83,12 +84,13 @@ const uint16_t SENSOR_LOW = 500;   // Min ADC plausibile sensore (sotto = errore
 const uint16_t SENSOR_HIGH = 4000; // Max ADC plausibile sensore (sopra = errore/disconnesso).
 
 // Intervalli check (secondi)
-const uint8_t CHECK_TEMP = 30UL;     // Ogni quanto controllare temperatura ESP32.
-const uint8_t CHECK_WIFI = 10UL;     // Ogni quanto controllare WiFi/RSSI.
-const uint16_t CHECK_MEMORY = 300UL; // Ogni quanto controllare heap/SPIFFS.
-const uint8_t CHECK_MOTOR = 5UL;     // Ogni quanto controllare durata motori.
-const uint8_t CHECK_TELEGRAM = 60UL; // Ogni quanto gestire check Telegram (se usato).
-const uint8_t CHECK_SENS = 20UL;     // Ogni quanto leggere sensori umidità.
+const uint8_t CHECK_TEMP = 30UL;       // Ogni quanto controllare temperatura ESP32.
+const uint8_t CHECK_WIFI = 10UL;       // Ogni quanto controllare WiFi/RSSI.
+const uint16_t CHECK_MEMORY = 300UL;   // Ogni quanto controllare heap/SPIFFS.
+const uint8_t CHECK_MOTOR = 5UL;       // Ogni quanto controllare durata motori.
+const uint8_t CHECK_TELEGRAM = 60UL;   // Ogni quanto gestire check Telegram (se usato).
+const uint32_t SENS_BASE_MS = 20000UL; // Ogni quanto leggere sensori umidità a motori spenti.
+const uint32_t SENS_IRR_MS = 3000UL;   // Ogni quanto leggere sensori umidità a motori accesi.
 
 RTC_DATA_ATTR uint32_t bootCounter = 0; // Contatore boot in RTC memory (persistente).
 
@@ -499,8 +501,13 @@ void loop()
     tgSend("Richiesta scaduta");
   }
 
-  // Sensori ogni CHECK_SENS secondi
-  if (now - lastSensors >= CHECK_SENS * 1000UL)
+  // Lettura sensori umidità
+  uint32_t sensInterval = motorsOnNow() ? SENS_IRR_MS : SENS_BASE_MS;
+
+  if (debug)
+    logLine(DEBUG_L, "DBG off1=" + String(offTimeMot1) + " off2=" + String(offTimeMot2) + " " + String(sensInterval), true, false);
+
+  if (now - lastSensors >= sensInterval)
   {
     lastSensors = now;
     handleSensore(false);
@@ -1692,9 +1699,8 @@ bool tgSend(const String &msg)
   return success;
 }
 
-// Gestione Meteo
 bool rilevoMeteo()
-{ // aggiorna la variabile meteo
+{
   if (WiFi.status() != WL_CONNECTED)
     return false;
 
@@ -2200,6 +2206,7 @@ void validazioneSensori(int raw1, int raw2)
   if (sensor1Error && !lastSensor1Error)
   {
     health.sensore1Disconnesso = true;
+    spegniMotori(1);
     logLine(WARN, "⚠️ Sensore 1 disconnesso (val: " + String(raw1) + ")", true, true);
   }
 
@@ -2216,6 +2223,7 @@ void validazioneSensori(int raw1, int raw2)
   if (sensor2Error && !lastSensor2Error)
   {
     health.sensore2Disconnesso = true;
+    spegniMotori(2);
     logLine(WARN, "⚠️ Sensore 2 disconnesso (val: " + String(raw2) + ")", true, true);
   }
   else if (!sensor2Error)
@@ -2830,7 +2838,7 @@ void nightlyReportTick(uint32_t nowMs)
   // Se sono in finestra e l’ultimo tentativo è fallito, riprova più spesso.
   if (lastAttemptFailedInWindow)
   {
-    nextCheckMs = nowMs + 15000UL; // retry ogni 15s dentro la finestra
+    nextCheckMs = nowMs + 60000UL; // retry ogni 15s dentro la finestra
   }
 
   const uint32_t dayId = computeDayId();
@@ -2860,7 +2868,7 @@ void nightlyReportTick(uint32_t nowMs)
 
 static bool sendNightlyReport()
 {
-  static const size_t TG_MAX = 3900; // margine sotto 4096
+  static const size_t TG_MAX = 3000; // margine sotto 4096
 
   // Buffer statico: niente realloc/fragmentation durante la costruzione del testo.
   static char buf[TG_MAX + 1];
@@ -2892,67 +2900,66 @@ static bool sendNightlyReport()
   const double avg1 = (stats.humN1 > 0) ? ((double)stats.humSum1 / (double)stats.humN1) : 0.0;
   const double avg2 = (stats.humN2 > 0) ? ((double)stats.humSum2 / (double)stats.humN2) : 0.0;
 
-  safePrintf("REPORT NOTTURNO\n");
-  safePrintf("Log: WARN %u / ERROR %u\n", (unsigned)stats.warnCount, (unsigned)stats.errCount);
+  safePrintf("🌙 REPORT NOTTURNO\n");
+  safePrintf("📊 Log: WARN %u | ERROR %u\n", (unsigned)stats.warnCount, (unsigned)stats.errCount);
 
+  // Stato generale (facoltativo ma utile)
+  if (health.sensore1Disconnesso || health.sensore2Disconnesso ||
+      health.motore1BloccatoSicurezza || health.motore2BloccatoSicurezza)
+  {
+    safePrintf("\n🧩 Stato:\n");
+    if (health.sensore1Disconnesso)
+      safePrintf("- Sensore 1: DISCONNESSO\n");
+    if (health.sensore2Disconnesso)
+      safePrintf("- Sensore 2: DISCONNESSO\n");
+    if (health.motore1BloccatoSicurezza)
+      safePrintf("- Motore 1: BLOCCATO SICUREZZA\n");
+    if (health.motore2BloccatoSicurezza)
+      safePrintf("- Motore 2: BLOCCATO SICUREZZA\n");
+  }
+
+  safePrintf("\n🌱 Umidità (giorno):\n");
   if (stats.humN1 == 0)
-  {
-    safePrintf("Umidita P1: ND\n");
-  }
+    safePrintf("- P1: ND\n");
   else
-  {
-    safePrintf("Umidita P1: min %u avg %.1f max %u\n",
+    safePrintf("- P1: min %u | avg %.1f | max %u\n",
                (unsigned)stats.humMin1, avg1, (unsigned)stats.humMax1);
-  }
 
   if (stats.humN2 == 0)
-  {
-    safePrintf("Umidita P2: ND\n");
-  }
+    safePrintf("- P2: ND\n");
   else
-  {
-    safePrintf("Umidita P2: min %u avg %.1f max %u\n",
+    safePrintf("- P2: min %u | avg %.1f | max %u\n",
                (unsigned)stats.humMin2, avg2, (unsigned)stats.humMax2);
-  }
 
-  safePrintf("Irrigazioni: M1 %u (%lus), M2 %u (%lus)\n",
-             (unsigned)stats.irrCount1, (unsigned long)stats.irrSec1,
-             (unsigned)stats.irrCount2, (unsigned long)stats.irrSec2);
+  safePrintf("\n🚿 Irrigazioni:\n");
+  safePrintf("- M1: %u volte (%lus)\n", (unsigned)stats.irrCount1, (unsigned long)stats.irrSec1);
+  safePrintf("- M2: %u volte (%lus)\n", (unsigned)stats.irrCount2, (unsigned long)stats.irrSec2);
 
-  safePrintf("Blocchi: pioggia %u, troppo presto %u, limite giorno %u\n\n",
-             (unsigned)stats.blockRain,
-             (unsigned)stats.blockTooSoon,
-             (unsigned)stats.blockDayLimit);
+  safePrintf("\n⛔ Blocchi:\n");
+  safePrintf("- Pioggia: %u\n", (unsigned)stats.blockRain);
+  safePrintf("- Troppo presto: %u\n", (unsigned)stats.blockTooSoon);
+  safePrintf("- Limite giorno: %u\n", (unsigned)stats.blockDayLimit);
 
   // Aggiungo ultimi warning/error con truncation pulita e nota finale.
+  const String tail = tailWarnError(20, false);
+  if (tail.length() > 0 && tail != "Nessun WARNING/ERROR nel log.")
   {
-    const String tail = tailWarnError(20, false);
+    safePrintf("\n⚠️ Ultimi warning/error:\n");
 
     const char *t = tail.c_str();
-    size_t tlen = tail.length();
-
+    const size_t tlen = tail.length();
     const char *note = "\n...(troncato)";
     const size_t noteLen = strlen(note);
 
     size_t room = (len < TG_MAX) ? (TG_MAX - len) : 0;
-    if (room > 0 && tlen > 0)
+    if (room > 0)
     {
       bool truncated = false;
-
       size_t take = tlen;
       if (take > room)
       {
         truncated = true;
-
-        // Prova a lasciare spazio per la nota finale
-        if (room > (noteLen + 1))
-        {
-          take = room - noteLen;
-        }
-        else
-        {
-          take = room; // niente spazio per nota, almeno copia quello che entra
-        }
+        take = (room > noteLen) ? (room - noteLen) : room;
       }
 
       const size_t start = len;
@@ -2962,13 +2969,13 @@ static bool sendNightlyReport()
 
       if (truncated)
       {
-        // Tronca a fine riga (se possibile) dentro al pezzo copiato
+        // taglia a fine riga se possibile
         size_t cut = len;
         for (size_t i = len; i > start; --i)
         {
           if (buf[i - 1] == '\n')
           {
-            cut = i - 1; // taglia PRIMA del newline
+            cut = i - 1;
             break;
           }
         }
@@ -2978,7 +2985,6 @@ static bool sendNightlyReport()
           buf[len] = '\0';
         }
 
-        // Aggiungi nota se c'è spazio
         if ((TG_MAX - len) >= noteLen)
         {
           memcpy(buf + len, note, noteLen);
