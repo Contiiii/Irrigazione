@@ -18,10 +18,10 @@
 
 // Pin utilizzati
 #define Pin_SensoreContenitore 34 // 18
-#define Pin_Sensore1 33 // 21
-#define Pin_Sensore2 32 // 19
-#define Pin_Relay1 18 //32 
-#define Pin_Relay2 19 //33
+#define Pin_Sensore1 33           // 21
+#define Pin_Sensore2 32           // 19
+#define Pin_Relay1 18             // 32
+#define Pin_Relay2 19             // 33
 
 // ========================= ENUM (stati/cause) =========================
 enum BotState
@@ -83,6 +83,9 @@ const uint16_t MIN_FREE_KB = 50;   // Soglia heap minima (KB) per allarme memori
 const uint16_t SENSOR_LOW = 500;   // Min ADC plausibile sensore (sotto = errore/disconnesso).
 const uint16_t SENSOR_HIGH = 4000; // Max ADC plausibile sensore (sopra = errore/disconnesso).
 
+const int ADC_DRY = 3300; // ADC sensore completamente asciutto
+const int ADC_WET = 1050; // ADC sensore completamente bagnato
+
 // Intervalli check (secondi)
 const uint8_t CHECK_TEMP = 30UL;       // Ogni quanto controllare temperatura ESP32.
 const uint8_t CHECK_WIFI = 10UL;       // Ogni quanto controllare WiFi/RSSI.
@@ -143,7 +146,7 @@ struct SystemHealth
   bool motore2AttivoTroppoTempo : 1; // Motore 2 oltre MAX_MOTOR_SECONDS.
 
   bool motore1BloccatoSicurezza = false; // Motore 1 bloccato
-  bool motore2BloccatoSicurezza = false; // Motore 1 bloccato
+  bool motore2BloccatoSicurezza = false; // Motore 2 bloccato
 
   bool irrigazioniTroppoFrequenti : 1; // Flag “troppo frequente” (se usato nei controlli).
 
@@ -649,6 +652,8 @@ void logLine(LogLevel lvl, const String &msg, bool newline = true, bool toTelegr
 
   // Serial
   Serial.print(line);
+  if (newline)
+    Serial.println();
 
   // Telnet
   if (telnetClient && telnetClient.connected())
@@ -1064,13 +1069,10 @@ void handleSensore(bool toTelegram)
 {
   int umidita[2];
 
-  int dryValue = 3300;
-  int wetValue = 1050;
-
   leggiSensori(umidita);
 
-  int umiditaSens1 = map(umidita[0], dryValue, wetValue, 0, 100);
-  int umiditaSens2 = map(umidita[1], dryValue, wetValue, 0, 100);
+  int umiditaSens1 = map(umidita[0], ADC_DRY, ADC_WET, 0, 100);
+  int umiditaSens2 = map(umidita[1], ADC_DRY, ADC_WET, 0, 100);
 
   umiditaSens1 = constrain(umiditaSens1, 0, 100);
   umiditaSens2 = constrain(umiditaSens2, 0, 100);
@@ -1646,6 +1648,31 @@ void handleMessage(String text, String chatId, String messageId)
     tgSend("Log cancellato.");
     return;
   }
+  if (text == "/start" || text == "/help")
+  {
+    String h = "🌿 *Comandi disponibili:*\n\n";
+    h += "📊 *Stato*\n";
+    h += "/sensore — umidità piante\n";
+    h += "/meteo — meteo attuale\n";
+    h += "/motori — stato motori\n";
+    h += "/health — stato sistema\n";
+    h += "/status — tutto insieme\n\n";
+    h += "💧 *Irrigazione*\n";
+    h += "/accendimotori — avvia irrigazione\n";
+    h += "/sblocca1 /sblocca2 /sblocca\n\n";
+    h += "⚙️ *Configurazione*\n";
+    h += "/auto on|off — abilita/disabilita AUTO\n";
+    h += "/soglie1 [start%] [stop%] — soglie zona 1\n";
+    h += "/soglie2 [start%] [stop%] — soglie zona 2\n\n";
+    h += "🔧 *Sistema*\n";
+    h += "/log — ultimi log\n";
+    h += "/alert — ultimi warning/error\n";
+    h += "/debug — toggle debug\n";
+    h += "/updatemeteo — forza aggiornamento meteo\n";
+    h += "/clearlog — cancella log";
+    tgSend(h);
+    return;
+  }
 
   logLine(INFO, String("Comando sconosciuto: ") + text, true, true);
 }
@@ -1704,9 +1731,12 @@ bool rilevoMeteo()
   if (WiFi.status() != WL_CONNECTED)
     return false;
 
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+
   String url;
   url.reserve(256);
-  url = "http://api.openweathermap.org/data/2.5/weather?q=";
+  url = "https://api.openweathermap.org/data/2.5/weather?q=";
   url += city;
   url += "&appid=";
   url += openWeatherMapApiKey;
@@ -1714,7 +1744,7 @@ bool rilevoMeteo()
 
   HTTPClient http;
   http.setTimeout(8000);
-  http.begin(url);
+  http.begin(secureClient, url);
 
   int httpCode = http.GET();
   if (httpCode != 200)
@@ -1930,6 +1960,9 @@ bool rilevoForecastPioggia()
   if (WiFi.status() != WL_CONNECTED)
     return false;
 
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+
   // Richiesta forecast: prendo pochi timestamp (cnt=3) per coprire fino a ~6-9 ore
   // OpenWeatherMap supporta cnt per limitare il numero di elementi in "list". [page:0]
   String url;
@@ -1939,7 +1972,7 @@ bool rilevoForecastPioggia()
 
   HTTPClient http;
   http.setTimeout(8000);
-  http.begin(url);
+  http.begin(secureClient, url);
   int httpCode = http.GET();
   if (httpCode != 200)
   {
@@ -2198,7 +2231,6 @@ void validazioneSensori(int raw1, int raw2)
 {
   static bool lastSensor1Error = false;
   static bool lastSensor2Error = false;
-  static const int WET_ADC = 1050, DRY_ADC = 3300; // ← costanti
 
   // Sensore 1
   bool sensor1Error = (raw1 < SENSOR_LOW || raw1 > SENSOR_HIGH);
@@ -2236,8 +2268,8 @@ void validazioneSensori(int raw1, int raw2)
   // check umidita critica
   if (!sensor1Error && !sensor2Error)
   {
-    int pct1 = map(constrain(raw1, WET_ADC, DRY_ADC), DRY_ADC, WET_ADC, 0, 100);
-    int pct2 = map(constrain(raw2, WET_ADC, DRY_ADC), DRY_ADC, WET_ADC, 0, 100);
+    int pct1 = map(constrain(raw1, ADC_WET, ADC_DRY), ADC_DRY, ADC_WET, 0, 100);
+    int pct2 = map(constrain(raw2, ADC_WET, ADC_DRY), ADC_DRY, ADC_WET, 0, 100);
 
     // Umidità sotto 15% su ALMENO UN sensore? → CRITICA
     bool critica = (pct1 < UMIDITA_CRITICA || pct2 < UMIDITA_CRITICA);
@@ -2309,6 +2341,8 @@ void checkTemperaturaESP32(uint32_t now)
 void checkWiFiSignal(uint32_t now)
 {
   static uint32_t lastCheck = 0;
+  static uint32_t reconnectStartMs = 0;
+  static bool reconnecting = false;
 
   if ((now - lastCheck) < (CHECK_WIFI * 1000UL))
     return;
@@ -2323,21 +2357,27 @@ void checkWiFiSignal(uint32_t now)
       logLine(ERROR_L, "📡❌ WiFi disconnesso!", true, true);
     }
 
-    logLine(WARN, "🔄📡 Tentativo riconnessione WiFi (non bloccante)...", true, false);
-
-    WiFi.disconnect();
-    delay(10);
-    ArduinoOTA.handle(); // OTA-safe
-    yield();
-
-    WiFi.begin(ssid, password); // avvia reconnessione, ma NON aspettare qui
-
-    // Se vuoi: dopo begin, prova a leggere status e loggare “in corso”
-    logLine(WARN, "📡⏳ WiFi: reconnessione avviata, riprovo al prossimo check", true, false);
+    // Avvia reconnessione SOLO se non già in corso
+    if (!reconnecting)
+    {
+      reconnecting = true;
+      reconnectStartMs = now;
+      WiFi.disconnect();
+      delay(10);
+      WiFi.begin(ssid, password);
+      logLine(WARN, "🔄📡 Reconnessione WiFi avviata...", true, false);
+    }
+    else if (now - reconnectStartMs > 30000UL)
+    {
+      // Dopo 30s senza successo, riprova
+      reconnecting = false;
+      logLine(WARN, "⏱️ Reconnessione timeout, nuovo tentativo...", true, false);
+    }
     return;
   }
 
-  // WiFi CONNESSO
+  // WiFi tornato online
+  reconnecting = false;
   if (health.wifiDisconnesso)
   {
     health.wifiDisconnesso = false;
@@ -2402,16 +2442,16 @@ int safeGetUpdates()
 
   tgBusy = true; // ← LOCK ACQUISITO
 
-  client.stop();
-  delay(50);
-
   client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
   bot.waitForResponse = 3000;
   bot.longPoll = 0;
 
   int n = bot.getUpdates(lastHandledUpdateId + 1);
 
-  client.stop();
+  if (n < 0)
+  {
+    client.stop();
+  }
 
   tgBusy = false; // ← LOCK RILASCIATO
 
@@ -2433,7 +2473,7 @@ int safeGetUpdates()
 void checkMemory(uint32_t now)
 {
   static uint32_t lastCheck = 0;
-  if ((now - lastCheck) < 300000UL)
+  if ((now - lastCheck) < (CHECK_MEMORY * 1000UL))
     return; // 300s = CHECK_MEMORY default
   lastCheck = now;
 
