@@ -17,11 +17,11 @@
 #include "secrets.h"
 
 // Pin utilizzati
-#define Pin_SensoreContenitore 34
-#define Pin_Sensore1 33
-#define Pin_Sensore2 32
-#define Pin_Relay1 18
-#define Pin_Relay2 19
+#define Pin_SensoreContenitore 34 // 18
+#define Pin_Sensore1 33 // 21
+#define Pin_Sensore2 32 // 19
+#define Pin_Relay1 18 //32 
+#define Pin_Relay2 19 //33
 
 // ========================= ENUM (stati/cause) =========================
 enum BotState
@@ -2941,7 +2941,7 @@ static bool sendNightlyReport()
   safePrintf("- Limite giorno: %u\n", (unsigned)stats.blockDayLimit);
 
   // Aggiungo ultimi warning/error con truncation pulita e nota finale.
-  const String tail = tailWarnError(20, false);
+  const String tail = tailWarnError(5, false);
   if (tail.length() > 0 && tail != "Nessun WARNING/ERROR nel log.")
   {
     safePrintf("\n⚠️ Ultimi warning/error:\n");
