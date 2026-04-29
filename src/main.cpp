@@ -17,11 +17,11 @@
 #include "secrets.h"
 
 // Pin utilizzati
-#define Pin_SensoreContenitore 34 // 18
-#define Pin_Sensore1 33           // 21
-#define Pin_Sensore2 32           // 19
-#define Pin_Relay1 18             // 32
-#define Pin_Relay2 19             // 33
+#define Pin_SensoreContenitore 18 // 18
+#define Pin_Sensore1 34         // 21
+#define Pin_Sensore2 33       // 19
+#define Pin_Relay1 35            // 32
+#define Pin_Relay2 32            // 33
 
 // ========================= ENUM (stati/cause) =========================
 enum BotState
