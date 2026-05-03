@@ -55,6 +55,7 @@ constexpr const char* CITY = "Vernasca,IT";
 constexpr int8_t RSSI_DEBOLE = -78;
 constexpr int8_t RSSI_CRITICO = -85;
 constexpr uint16_t TELNET_PORT = 23;
+constexpr uint32_t WIFI_BOOT_TIMEOUT_MS = 20000UL; // 20s timeout boot WiFi
 constexpr const char* OTA_HOSTNAME = "esp32-ota";
 
 // =========================
@@ -88,7 +89,7 @@ constexpr uint32_t BOOST_TELNET_MS = 60000UL;
 constexpr uint32_t BOOST_IRR_MS = 180000UL;
 
 constexpr uint32_t TELEGRAM_MIN_INTERVAL_MS = 1200UL;
-//constexpr uint32_t MOTOR_DEBOUNCE_INTERVAL_MS = 2000UL;
+constexpr uint32_t MOTOR_DEBOUNCE_INTERVAL = 2000UL;
 constexpr uint32_t STATE_TIMEOUT_WINDOW_MS = 30000UL;
 constexpr uint32_t TG_DEDUPE_MS = 5000UL;
 constexpr uint32_t TG_LOCK_TIMEOUT_MS = 5000UL;
