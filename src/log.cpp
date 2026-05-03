@@ -1,5 +1,6 @@
 #include "log.h"
-#include "telegram.h"   // solo per tgSend() nei logLine con toTelegram=true
+#include "telegram.h" 
+#include "utils.h"  // solo per tgSend() nei logLine con toTelegram=true
 
 // ── Variabili globali di questo modulo ──────────────────────────────
 bool   spiffsOK  = false;
@@ -73,10 +74,6 @@ void logLine(LogLevel lvl, const String &msg, bool newline, bool toTelegram)
         telnetClient.print(line);
         if (newline) telnetClient.print("\r\n");
     }
-
-    // Statistiche (extern da stats.h)
-    extern void statsCountLog(LogLevel);
-    statsCountLog(lvl);
 
     // Telegram
     if (toTelegram) tgSend(String(line));

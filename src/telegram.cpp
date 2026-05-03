@@ -1,14 +1,24 @@
 #include "telegram.h"
 #include "log.h"
 #include "config.h"
-#include "motori.h"   // per accendiMotori, requestIrrigation, ecc.
-#include "meteo.h"    // per rilevoMeteo, irrigazioneConsentita
-#include "health.h"   // per handleHealth
-#include "stats.h"    // per tailWarnError
+#include "secrets.h"
+#include "health.h"
+#include "motori.h"
+#include "meteo.h"
+#include "utils.h"
+#include <esp_wifi.h>
+
+// Da sensori.h (non ancora creato)
+void handleSensore(bool forced);
+// Da telnet.h (non ancora creato)
+bool telnetOnNow();
+
+// Da main.cpp / stats
+extern long lastHandledUpdateId;
 
 // ── Istanze ─────────────────────────────────────────────────────────
 WiFiClientSecure client;
-UniversalTelegramBot bot(BOTtoken, client);
+UniversalTelegramBot bot(SECRET_BOT_TOKEN, client);
 
 // ── Stato bot ───────────────────────────────────────────────────────
 BotState botstate = IDLE;
@@ -139,7 +149,7 @@ void handleMessage(String text, String chatId, String messageId)
   text.trim(); // come già fai [file:188]
 
   // Sicurezza: rispondi solo alla chat autorizzata
-  if (chatId != String(CHAT_ID))
+  if (chatId != String(SECRET_CHAT_ID))
   {
     // opzionale: logLine(WARN, "Chat non autorizzata: " + chatId, true, false);
     return;
@@ -208,7 +218,7 @@ void handleMessage(String text, String chatId, String messageId)
         "]]");
 
     bot.sendMessageWithInlineKeyboard(
-        CHAT_ID,
+        SECRET_CHAT_ID,
         "Scegli cosa accendere:",
         "",
         keyboardJson);
@@ -339,7 +349,7 @@ tgBusy = true;
   }
 
   bot.waitForResponse = 3000;
-  bool success = bot.sendMessage(CHAT_ID, msg, "");
+  bool success = bot.sendMessage(SECRET_CHAT_ID, msg, "");
 
   // ✅ Chiudi SOLO se fallisce (per forzare riconnessione)
   if (!success)
@@ -377,13 +387,13 @@ void askTime(const String &who)
       "]]");
 
   bot.sendMessageWithInlineKeyboard(
-      CHAT_ID,
+      SECRET_CHAT_ID,
       "Quanto tempo per " + who + "?",
       "",
       keyboardJson);
 }
 
-static inline bool isNightHour(int h) // Ritorna true se l'ora è nella fascia NOTTE.
+bool isNightHour(int h) // Ritorna true se l'ora è nella fascia NOTTE.
 {
   // Valori non validi => considera "notte"
   if (h < 0 || h > 23)
@@ -401,7 +411,7 @@ static inline bool isNightHour(int h) // Ritorna true se l'ora è nella fascia N
   return (h > end) && (h < start);
 }
 
-static inline void boostPolling(uint32_t ms) // Attiva un periodo di polling "boost" (più frequente) per ms millisecondi.
+void boostPolling(uint32_t ms) // Attiva un periodo di polling "boost" (più frequente) per ms millisecondi.
 {
   const uint32_t now = millis();
   const uint32_t until = now + ms;
@@ -417,7 +427,7 @@ static inline void boostPolling(uint32_t ms) // Attiva un periodo di polling "bo
   nextWifiPolicyMs = 0;
 }
 
-static inline uint32_t currentPollDelayMs(int hourNow, uint32_t nowMs) // Restituisce il delay di polling in base all'ora e allo stato boost.
+uint32_t currentPollDelayMs(int hourNow, uint32_t nowMs) // Restituisce il delay di polling in base all'ora e allo stato boost.
 {
   const uint32_t base = isNightHour(hourNow) ? POLL_NIGHT_MS : POLL_DAY_MS;
 
@@ -429,12 +439,12 @@ static inline uint32_t currentPollDelayMs(int hourNow, uint32_t nowMs) // Restit
   return base;
 }
 
-static inline bool isBoostedNow(uint32_t nowMs) // True se adesso (nowMs) siamo in periodo boost.
+bool isBoostedNow(uint32_t nowMs) // True se adesso (nowMs) siamo in periodo boost.
 {
   return (int32_t)(nowMs - pollBoostUntilMs) < 0;
 }
 
-static inline void wifiFollowPolling(uint32_t nowMs, uint32_t delayMs) // Allinea la policy di WiFi power-save con la frequenza di polling
+void wifiFollowPolling(uint32_t nowMs, uint32_t delayMs) // Allinea la policy di WiFi power-save con la frequenza di polling
 {
   // Rate limit: evita toggle continui (ogni 5s massimo)
   if ((int32_t)(nowMs - nextWifiPolicyMs) < 0)
@@ -470,19 +480,19 @@ static inline void wifiFollowPolling(uint32_t nowMs, uint32_t delayMs) // Alline
   wifiPsOn = wantPs;
 }
 
-static inline void armStateTimeout(uint32_t windowMs)
+void armStateTimeout(uint32_t windowMs)
 {
   stateTimeoutMs = millis() + windowMs;
 }
 
-static inline void resetAskSession()
+void resetAskSession()
 {
   botstate = IDLE;
   motorOperationInProgress = false;
   stateTimeoutMs = 0;
 }
 
-static inline bool isStateTimeoutExpired()
+bool isStateTimeoutExpired()
 {
   return stateTimeoutMs != 0 && (int32_t)(millis() - stateTimeoutMs) >= 0; // overflow-safe
 }

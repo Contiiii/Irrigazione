@@ -2,13 +2,10 @@
 // modificata lettura sensori a motori accesi (3s), aggiunto blocco motori quando sensori disconnessi, modificato report notturno
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
 #include <ArduinoOTA.h>
-#include <UniversalTelegramBot.h>
 #include <time.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <SPIFFS.h>
 #include <math.h>
 #include "esp_heap_caps.h"
 #include <esp_system.h>
@@ -16,24 +13,11 @@
 
 #include "secrets.h"
 #include "config.h"
+#include "log.h"
+#include "telegram.h"
+#include "utils.h"
 
 // ========================= ENUM (stati/cause) =========================
-enum BotState
-{
-  IDLE,
-  ASK_TIME_MOT1,
-  ASK_TIME_MOT2,
-  ASK_TIME_BOTH
-}; // Stato “conversazione” Telegram (idle/attesa durata).
-
-enum LogLevel
-{
-  INFO,
-  DEBUG_L,
-  WARN,
-  ERROR_L
-}; // Livello severità log.
-
 enum MotorSel
 {
   Motore_1 = 1,
@@ -153,13 +137,7 @@ struct DailyStats
 };
 
 // ========================= ISTANZE / STATO RUNTIME =========================
-BotState botstate = IDLE;         // Stato bot (idle/attesa durata).
 MotorSel pendingMotor = Motore_1; // Motore selezionato, in attesa durata.
-
-bool timeReady = false; // Ora NTP valida (per timestamp log).
-bool spiffsOK = false;  // SPIFFS montato OK.
-
-size_t logBytes = 0; // Byte già scritti nel log corrente (rotazione).
 
 DatiMeteo meteo;                             // Meteo attuale + forecast.
 bool bloccoIrrigazione = false;              // True se irrigazione bloccata (pioggia/forecast).
@@ -172,11 +150,10 @@ SystemHealth health = {}; // Stato salute (flag+valori misurati).
 AutoZone az1, az2;       // Zone auto (vaso 1 / vaso 2).
 bool autoEnabled = true; // Abilita/disabilita AUTO globale.
 
-unsigned long offTimeMot1 = 0; // millis() spegnimento programmato motore 1 (0=spento).
-unsigned long offTimeMot2 = 0; // millis() spegnimento programmato motore 2 (0=spento).
+uint32_t offTimeMot1 = 0;
+uint32_t offTimeMot2 = 0;
 
 bool manutenzione = false; // Modalità manutenzione (se la usi per bypass).
-bool debug = false;        // Abilita log DEBUG_L.
 
 static DailyStats stats; // Statistiche giornaliere.
 
@@ -195,9 +172,6 @@ String openWeatherMapApiKey = SECRET_API_OPENWEATHER; // API key OpenWeatherMap.
 #define BOTtoken SECRET_BOT_TOKEN // Token bot Telegram.
 #define CHAT_ID SECRET_CHAT_ID    // Chat ID autorizzato.
 
-WiFiClientSecure client;                    // Client TLS per Telegram.
-UniversalTelegramBot bot(BOTtoken, client); // Istanza bot Telegram.
-
 WiFiServer telnetServer(TELNET_PORT); // Server Telnet (porta 23).
 WiFiClient telnetClient;     // Client Telnet corrente.
 String telnetLine;           // Buffer riga comandi Telnet.
@@ -208,7 +182,6 @@ unsigned long lastTelegramMs = 0;                    // millis() ultimo invio me
 long lastHandledUpdateId = 0;                       // Ultimo update_id gestito (anti-doppio).
 unsigned long lastMotorCommandTime = 0;             // millis() ultimo comando motore (debounce).
 
-bool motorOperationInProgress = false;            // True se “sessione” manuale in corso.
 static uint32_t stateTimeoutMs = 0;               // millis() scadenza attesa risposta durata.
 
 RTC_DATA_ATTR long lastHandledUpdateIdRTC = 0; // Persistente!
@@ -220,15 +193,6 @@ static uint8_t tgSendCounter = 0;            // per debug duplicati
 
 // ✅ LOCK per evitare che safeGetUpdates() e tgSend() corrano in parallelo
 static volatile bool tgBusy = false;
-
-// Prototipi di log
-String getTime();
-void appendLogFile(const String &line);
-void logLine(LogLevel lvl, const String &msg, bool newline, bool toTelegram);
-String tailLog(int maxLines);
-String tailWarnError(int maxLines = 50, bool includeOld = false);
-void handleDebug();
-void initLogSize();
 
 // Prototipi di telnet
 void handleTelnet();
@@ -245,17 +209,8 @@ void handleSensore(bool toTelegram);
 // Prototipi dei motori
 void accendiMotori(int who, int tempo);
 void spegniMotori(int who);
-void askTime(const String &who);
 void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk);
-static inline void armStateTimeout(uint32_t windowMs);
-static inline bool isStateTimeoutExpired();
-static inline void resetAskSession();
-static inline String motorLabel(uint8_t m);
-
-// Prototipi per messaggi telegram
-void handleCallBack(String text, String chatId, String messageId);
-void handleMessage(String text, String chatId, String messageId);
-bool tgSend(const String &msg);
+void armStateTimeout(uint32_t windowMs);
 
 // Rilevo meteo
 bool rilevoMeteo();
@@ -279,7 +234,6 @@ void checkTemperaturaESP32(uint32_t now);
 void handleHealth();
 void checkWiFiSignal(uint32_t now);
 void checkTelegramConnection(uint32_t now);
-int safeGetUpdates();
 void checkMemory(uint32_t now);
 void checkMotori(uint32_t now);
 
@@ -297,14 +251,6 @@ void nightlyReportTick(uint32_t nowMs);
 static bool sendNightlyReport();
 static void resetDailyStats();
 
-// helper per polling e wifi sleep mode adattivi
-static inline bool isNightHour(int h);
-static inline void boostPolling(uint32_t ms);
-static inline uint32_t currentPollDelayMs(int hourNow, uint32_t nowMs);
-static inline void wifiFollowPolling(uint32_t nowMs, uint32_t delayMs);
-static inline bool isBoostedNow(uint32_t nowMs);
-static inline bool motorsOnNow();
-static inline bool telnetOnNow();
 
 void setup()
 {
@@ -359,9 +305,6 @@ if (WiFi.status() != WL_CONNECTED)
   // client.setTimeout(7000);
   bot.waitForResponse = 5000;
   lastHandledUpdateId = lastHandledUpdateIdRTC;
-
-  // Messaggio di avvio
-  tgSend("BOT ATTIVO " + WiFi.macAddress() + " boot#" + String(bootCounter));
 
   // Avvio modalita OTA
   ArduinoOTA.setHostname(OTA_HOSTNAME);
@@ -509,254 +452,6 @@ void loop()
 
     // Scheduler: prossimo polling
     nextPollMs = now + delayMs;
-  }
-}
-
-// Funzioni di log
-String getTime()
-{
-  if (!timeReady)
-    return "BOOT";
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo))
-    return "No time!";
-
-  const char *giorni[] = {"DOM", "LUN", "MAR", "MER", "GIO", "VEN", "SAB"};
-
-  char buff[32];
-
-  sprintf(buff, "%s %02d/%02d %02d:%02d:%02d",
-          giorni[timeinfo.tm_wday],
-          timeinfo.tm_mday, timeinfo.tm_mon + 1,
-          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-
-  return String(buff);
-}
-
-void appendLogFile(const String &line)
-{
-  if (!spiffsOK)
-    return;
-
-  static uint16_t writeCount = 0;
-
-  // ✅ Controlla spazio solo ogni 100 scritture
-  if (writeCount % 100 == 0)
-  {
-    if (SPIFFS.totalBytes() - SPIFFS.usedBytes() < 10240)
-    {
-      SPIFFS.remove(LOG_OLD_FILE);
-      SPIFFS.rename(LOG_FILE, LOG_OLD_FILE);
-      logBytes = 0;
-    }
-  }
-
-  writeCount++;
-
-  // Rotazione normale
-  if (logBytes + line.length() > MAX_LOG_SIZE)
-  {
-    SPIFFS.remove(LOG_OLD_FILE);
-    SPIFFS.rename(LOG_FILE, LOG_OLD_FILE);
-    logBytes = 0;
-  }
-
-  File f = SPIFFS.open(LOG_FILE, FILE_APPEND);
-  if (!f)
-    return;
-
-  size_t written = f.print(line);
-  f.close();
-
-  logBytes += written;
-}
-
-void logLine(LogLevel lvl, const String &msg, bool newline = true, bool toTelegram = false)
-{
-  if (!debug && lvl == DEBUG_L)
-    return;
-
-  const char *L[] = {"I", "D", "W", "E"};
-
-  // ✅ Buffer statico (zero allocazioni heap)
-  static char line[512];
-  int pos = 0;
-
-  // Formatta direttamente in buffer
-  pos = snprintf(line, sizeof(line), "%s | %s | %s", getTime().c_str(), L[lvl], msg.c_str()); // Uno c_str() solo per il messaggio
-
-  if (pos < 0 || pos >= (int)sizeof(line))
-    pos = sizeof(line) - 1; // Protezione overflow
-
-  // Log file
-  appendLogFile(String(line) + "\r\n"); // Una sola String conversione
-
-  // Serial
-  Serial.print(line);
-  if (newline)
-    Serial.println();
-
-  // Telnet
-  if (telnetClient && telnetClient.connected())
-  {
-    telnetClient.print(line);
-    if (newline)
-      telnetClient.print("\r\n");
-  }
-
-  // Statistiche
-  if (lvl == WARN)
-    stats.warnCount++;
-  if (lvl == ERROR_L)
-    stats.errCount++;
-
-  // Telegram
-  if (toTelegram)
-    tgSend(String(line)); // Una conversione sola
-}
-
-String tailLog(int maxLines)
-{
-  File f = SPIFFS.open(LOG_FILE, FILE_READ);
-  if (!f)
-    return "Nessun log.";
-
-  if (maxLines <= 0)
-    maxLines = 50;
-  if (maxLines > 200)
-    maxLines = 200;
-
-  // ✅ Alloca dinamicamente
-  String *lines = new String[maxLines];
-  if (!lines)
-    return "Out of memory";
-
-  int idx = 0;
-  while (f.available() && idx < maxLines * 2)
-  { // Leggi max 2x per safety
-    lines[idx % maxLines] = f.readStringUntil('\n');
-    idx++;
-  }
-  f.close();
-
-  int start = max(0, idx - maxLines);
-  String out;
-  out.reserve(2528);
-
-  for (int i = start; i < idx; i++)
-  {
-    out += lines[i % maxLines];
-    out += "\n";
-  }
-
-  delete[] lines; // ✅ Libera
-  return out;
-}
-
-String tailWarnError(int maxLines, bool includeOld)
-{
-  if (!spiffsOK)
-    return "SPIFFS non disponibile";
-
-  const size_t MAX_OUT = 3500;
-  const int CAP = 80; // Ridotto da 120
-  int requestedLines = min(maxLines, CAP);
-
-  // ✅ Alloca SOLO quando richiesto
-  String *ring = new String[requestedLines];
-  if (!ring)
-  {
-    return "Out of memory";
-  }
-
-  // Pre-alloca i buffer
-  for (int i = 0; i < requestedLines; i++)
-  {
-    ring[i].reserve(128);
-  }
-
-  int cap = requestedLines;
-  int idx = 0;
-
-  auto scanFile = [&](const char *path)
-  {
-    File f = SPIFFS.open(path, FILE_READ);
-    if (!f)
-      return;
-
-    while (f.available())
-    {
-      String s = f.readStringUntil('\n');
-      s.trim();
-
-      if (s.indexOf(" | W | ") >= 0 || s.indexOf(" | E | ") >= 0)
-      {
-        ring[idx % cap] = s;
-        idx++;
-      }
-    }
-    f.close();
-  };
-
-  if (includeOld)
-    scanFile(LOG_OLD_FILE);
-  scanFile(LOG_FILE);
-
-  if (idx == 0)
-  {
-    delete[] ring; // ✅ Libera prima di ritornare
-    return "Nessun WARNING/ERROR nel log.";
-  }
-
-  int start = max(0, idx - cap);
-
-  String out;
-  out.reserve(MAX_OUT);
-  out = "Ultimi ";
-  out += String(min(idx, cap));
-  out += " WARNING/ERROR:\n\n";
-
-  for (int i = start; i < idx; i++)
-  {
-    const String &line = ring[i % cap];
-    if (out.length() + line.length() + 1 > MAX_OUT)
-      break;
-    out += line;
-    out += "\n";
-  }
-
-  delete[] ring; // ✅ Libera memoria
-  return out;
-}
-
-void handleDebug()
-{
-  debug = !debug;
-  logLine(INFO, debug ? "🔧 DEBUG ATTIVO" : "🔧 DEBUG DISATTIVO", true, true);
-}
-
-void initLogSize()
-{
-  File r = SPIFFS.open(LOG_FILE, FILE_READ);
-  if (!r)
-  {
-    logBytes = 0;
-    return;
-  }
-
-  size_t sz = r.size();
-  r.close();
-
-  // ✅ Protezione: se size > MAX_LOG_SIZE, forza rotazione
-  if (sz > MAX_LOG_SIZE)
-  {
-    SPIFFS.remove(LOG_OLD_FILE);
-    SPIFFS.rename(LOG_FILE, LOG_OLD_FILE);
-    logBytes = 0;
-  }
-  else
-  {
-    logBytes = sz;
   }
 }
 
@@ -1270,17 +965,6 @@ void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk)
     logLine(INFO, "⏸️ AUTO STOP motore " + motorLabel(m) + " umid=" + String(humPct) + "%", true, true);
     return;
   }
-}
-
-static inline String motorLabel(uint8_t m)
-{
-  if (m == 1)
-    return "1";
-  if (m == 2)
-    return "2";
-  if (m == 3)
-    return "1+2"; // oppure "Entrambi"
-  return "?";
 }
 
 // Messaggi telegram
@@ -2551,18 +2235,6 @@ static bool sendNightlyReport()
 static inline void resetDailyStats()
 {
   stats = DailyStats(); // reset totale (richiede costruttori/valori di default)
-}
-
-// helper per polling e wifi sleep mode adattivi
-
-static inline bool motorsOnNow() // Motori ON se c'è un offTime programmato (vuol dire che sono in esecuzione).
-{
-  return (offTimeMot1 != 0) || (offTimeMot2 != 0);
-}
-
-static inline bool telnetOnNow() // Telnet "attivo" se c'è un client e la connessione è aperta.
-{
-  return (telnetClient && telnetClient.connected());
 }
 
 

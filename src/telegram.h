@@ -26,3 +26,7 @@ bool isBoostedNow(uint32_t nowMs);
 uint32_t currentPollDelayMs(int hourNow, uint32_t nowMs);
 void wifiFollowPolling(uint32_t nowMs, uint32_t delayMs);
 bool isNightHour(int h);
+
+bool isStateTimeoutExpired();
+void resetAskSession();
+void armStateTimeout(uint32_t ms);
