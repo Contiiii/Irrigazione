@@ -15,13 +15,7 @@
 #include <esp_wifi.h>
 
 #include "secrets.h"
-
-// Pin utilizzati
-#define Pin_SensoreContenitore 18 // 18
-#define Pin_Sensore1 34         // 21
-#define Pin_Sensore2 33       // 19
-#define Pin_Relay1 35            // 32
-#define Pin_Relay2 32            // 33
+#include "config.h"
 
 // ========================= ENUM (stati/cause) =========================
 enum BotState
@@ -57,54 +51,9 @@ enum IrrigationBlockReason : uint8_t
 }; // Motivo blocco irrigazione.
 
 // ========================= CONFIG / COSTANTI =========================
-const size_t MAX_LOG_SIZE = 400 * 1024;                         // Dimensione max /log.txt prima della rotazione.
-const unsigned long DurataBloccoPioggia = 1000UL * 60UL * 60UL; // Durata blocco standard “piove ora” (1h).
-
-const unsigned long intervallo_Refresh_Giorno = 1000UL * 60UL * 60UL;      // Refresh meteo/forecast di giorno (1h).
-const unsigned long intervallo_Refresh_Notte = 1000UL * 60UL * 60UL * 3UL; // Refresh meteo/forecast di notte (3h).
-const unsigned long durata_Cash_Valida = 1000UL * 60UL * 30UL;             // Validità cache meteo (30 min).
-const unsigned long durataCacheForecast = 1000UL * 60UL * 30UL;            // Validità cache forecast (30 min).
-const float soglia_Minima_Pioggia = 0.5f;                                  // Soglia mm per considerare “pioggia rilevante”.
-
-const int ora_Inizio_Giorno = 6; // Ora inizio fascia “giorno”.
-const int ora_Fine_Giorno = 23;  // Ora fine fascia “giorno”.
-
-const int8_t RSSI_DEBOLE = -78;     // Soglia RSSI “debole” (dBm).
-const int8_t RSSI_CRITICO = -85;    // Soglia RSSI “critico” (dBm).
-const float TEMP_WARNING = 75.0f;   // Soglia warning temperatura ESP32 (°C).
-const float TEMP_CRITICAL = 85.0f;  // Soglia critica temperatura ESP32 (°C).
-const uint8_t UMIDITA_CRITICA = 15; // Soglia umidità (%) per allarme “critica”.
-
-const uint16_t MAX_MOTOR_SECONDS = 120;     // Massima durata continua motore (fail-safe).
-const uint32_t MIN_IRRIGATION_MS = 30000UL; // Distanza minima tra irrigazioni dello stesso motore (rate-limit).
-const uint8_t MAX_IRRIGATIONS_DAY = 10;     // Max irrigazioni/giorno per motore.
-
-const uint16_t MIN_FREE_KB = 50;   // Soglia heap minima (KB) per allarme memoria.
-const uint16_t SENSOR_LOW = 500;   // Min ADC plausibile sensore (sotto = errore/disconnesso).
-const uint16_t SENSOR_HIGH = 4000; // Max ADC plausibile sensore (sopra = errore/disconnesso).
-
-const int ADC_DRY = 3300; // ADC sensore completamente asciutto
-const int ADC_WET = 1050; // ADC sensore completamente bagnato
-
-// Intervalli check (secondi)
-const uint8_t CHECK_TEMP = 30UL;       // Ogni quanto controllare temperatura ESP32.
-const uint8_t CHECK_WIFI = 10UL;       // Ogni quanto controllare WiFi/RSSI.
-const uint16_t CHECK_MEMORY = 300UL;   // Ogni quanto controllare heap/SPIFFS.
-const uint8_t CHECK_MOTOR = 5UL;       // Ogni quanto controllare durata motori.
-const uint8_t CHECK_TELEGRAM = 60UL;   // Ogni quanto gestire check Telegram (se usato).
-const uint32_t SENS_BASE_MS = 20000UL; // Ogni quanto leggere sensori umidità a motori spenti.
-const uint32_t SENS_IRR_MS = 3000UL;   // Ogni quanto leggere sensori umidità a motori accesi.
 
 RTC_DATA_ATTR uint32_t bootCounter = 0; // Contatore boot in RTC memory (persistente).
 
-// Polling Telegram adattivo
-static const uint32_t POLL_DAY_MS = 5000;
-static const uint32_t POLL_NIGHT_MS = 20000;
-static const uint32_t POLL_BOOST_MS = 3000;    // quanto spesso durante boost (reattivo)
-static const uint32_t BOOST_MSG_MS = 120000;   // 2 min dopo msg Telegram
-static const uint32_t BOOST_MOTOR_MS = 300000; // 5 min quando motori ON
-static const uint32_t BOOST_TELNET_MS = 60000; // 1 min dopo connessione telnet (poi rinnovi se resta attivo)
-static const uint32_t BOOST_IRR_MS = 180000;   // 3 min se irrigazione richiesta/partita
 
 // ========================= STRUTTURE DATI =========================
 struct DatiMeteo
@@ -231,10 +180,6 @@ bool debug = false;        // Abilita log DEBUG_L.
 
 static DailyStats stats; // Statistiche giornaliere.
 
-static const uint8_t NIGHT_REPORT_HOUR = 3;     // Ora invio report notturno.
-static const uint8_t NIGHT_REPORT_MIN_FROM = 0; // Minuto inizio finestra report.
-static const uint8_t NIGHT_REPORT_MIN_TO = 59;  // Minuto fine finestra report.
-
 static uint32_t pollBoostUntilMs = 0; // fino a quando restare in boost
 static uint32_t nextPollMs = 0;       // scheduler (al posto di lastTimeBotRan + botRequestDelay)
 
@@ -246,7 +191,6 @@ const char *ssid = SECRET_WIFI_SSID;     // SSID WiFi (secrets.h).
 const char *password = SECRET_WIFI_PASS; // Password WiFi (secrets.h).
 
 String openWeatherMapApiKey = SECRET_API_OPENWEATHER; // API key OpenWeatherMap.
-String city = "Vernasca,IT";                          // Città per chiamate meteo.
 
 #define BOTtoken SECRET_BOT_TOKEN // Token bot Telegram.
 #define CHAT_ID SECRET_CHAT_ID    // Chat ID autorizzato.
@@ -254,13 +198,12 @@ String city = "Vernasca,IT";                          // Città per chiamate met
 WiFiClientSecure client;                    // Client TLS per Telegram.
 UniversalTelegramBot bot(BOTtoken, client); // Istanza bot Telegram.
 
-WiFiServer telnetServer(23); // Server Telnet (porta 23).
+WiFiServer telnetServer(TELNET_PORT); // Server Telnet (porta 23).
 WiFiClient telnetClient;     // Client Telnet corrente.
 String telnetLine;           // Buffer riga comandi Telnet.
 
 // ========================= SCHEDULER TELEGRAM =========================
 unsigned long lastTelegramMs = 0;                    // millis() ultimo invio messaggio (anti-spam).
-const unsigned long TELEGRAM_MIN_INTERVAL_MS = 1200; // ms min tra sendMessage.
 
 long lastHandledUpdateId = 0;                       // Ultimo update_id gestito (anti-doppio).
 unsigned long lastMotorCommandTime = 0;             // millis() ultimo comando motore (debounce).
@@ -268,19 +211,16 @@ const unsigned long MOTOR_DEBOUNCE_INTERVAL = 2000; // ms debounce pulsanti inli
 
 bool motorOperationInProgress = false;            // True se “sessione” manuale in corso.
 static uint32_t stateTimeoutMs = 0;               // millis() scadenza attesa risposta durata.
-const uint32_t STATE_TIMEOUT_WINDOW_MS = 30000UL; // ms timeout scelta durata.
 
 RTC_DATA_ATTR long lastHandledUpdateIdRTC = 0; // Persistente!
 
 // da sistemare
 static uint32_t tgLastSendMs = 0;            // ultimo invio OK
 static String tgLastPayload = "";            // ultimo messaggio inviato
-static const uint32_t TG_DEDUPE_MS = 5000UL; // dedupe 5s
 static uint8_t tgSendCounter = 0;            // per debug duplicati
 
 // ✅ LOCK per evitare che safeGetUpdates() e tgSend() corrano in parallelo
 static volatile bool tgBusy = false;
-const uint32_t TG_LOCK_TIMEOUT_MS = 5000UL; // timeout di sicurezza se uno si blocca
 
 // Prototipi di log
 String getTime();
@@ -423,7 +363,7 @@ void setup()
   tgSend("BOT ATTIVO " + WiFi.macAddress() + " boot#" + String(bootCounter));
 
   // Avvio modalita OTA
-  ArduinoOTA.setHostname("esp32-ota");
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
   ArduinoOTA.begin();
 
   // Avvio modalita TELNET
@@ -604,8 +544,8 @@ void appendLogFile(const String &line)
   {
     if (SPIFFS.totalBytes() - SPIFFS.usedBytes() < 10240)
     {
-      SPIFFS.remove("/log.old");
-      SPIFFS.rename("/log.txt", "/log.old");
+      SPIFFS.remove(LOG_OLD_FILE);
+      SPIFFS.rename(LOG_FILE, LOG_OLD_FILE);
       logBytes = 0;
     }
   }
@@ -615,12 +555,12 @@ void appendLogFile(const String &line)
   // Rotazione normale
   if (logBytes + line.length() > MAX_LOG_SIZE)
   {
-    SPIFFS.remove("/log.old");
-    SPIFFS.rename("/log.txt", "/log.old");
+    SPIFFS.remove(LOG_OLD_FILE);
+    SPIFFS.rename(LOG_FILE, LOG_OLD_FILE);
     logBytes = 0;
   }
 
-  File f = SPIFFS.open("/log.txt", FILE_APPEND);
+  File f = SPIFFS.open(LOG_FILE, FILE_APPEND);
   if (!f)
     return;
 
@@ -676,7 +616,7 @@ void logLine(LogLevel lvl, const String &msg, bool newline = true, bool toTelegr
 
 String tailLog(int maxLines)
 {
-  File f = SPIFFS.open("/log.txt", FILE_READ);
+  File f = SPIFFS.open(LOG_FILE, FILE_READ);
   if (!f)
     return "Nessun log.";
 
@@ -758,8 +698,8 @@ String tailWarnError(int maxLines, bool includeOld)
   };
 
   if (includeOld)
-    scanFile("/log.old");
-  scanFile("/log.txt");
+    scanFile(LOG_OLD_FILE);
+  scanFile(LOG_FILE);
 
   if (idx == 0)
   {
@@ -796,7 +736,7 @@ void handleDebug()
 
 void initLogSize()
 {
-  File r = SPIFFS.open("/log.txt", FILE_READ);
+  File r = SPIFFS.open(LOG_FILE, FILE_READ);
   if (!r)
   {
     logBytes = 0;
@@ -809,8 +749,8 @@ void initLogSize()
   // ✅ Protezione: se size > MAX_LOG_SIZE, forza rotazione
   if (sz > MAX_LOG_SIZE)
   {
-    SPIFFS.remove("/log.old");
-    SPIFFS.rename("/log.txt", "/log.old");
+    SPIFFS.remove(LOG_OLD_FILE);
+    SPIFFS.rename(LOG_FILE, LOG_OLD_FILE);
     logBytes = 0;
   }
   else
@@ -898,7 +838,7 @@ void handleTelnetCommand(const String &cmd)
     int n = arg.toInt();
     if (n <= 0)
       n = 50;
-    telnetSendTail("/log.txt", n);
+    telnetSendTail(LOG_FILE, n);
   }
   else if (cmd == "tgreset")
   {
@@ -910,7 +850,7 @@ void handleTelnetCommand(const String &cmd)
   }
   else if (cmd == "clear")
   {
-    SPIFFS.remove("/log.txt");
+    SPIFFS.remove(LOG_FILE);
     telnetClient.println("OK cleared.");
   }
   else if (cmd == "health")
@@ -920,7 +860,7 @@ void handleTelnetCommand(const String &cmd)
   }
   else if (cmd == "size")
   {
-    File f = SPIFFS.open("/log.txt", FILE_READ);
+    File f = SPIFFS.open(LOG_FILE, FILE_READ);
     telnetClient.printf("log.txt = %u bytes\r\n", f ? (unsigned)f.size() : 0);
     if (f)
       f.close();
@@ -1014,8 +954,8 @@ void telnetPrintAllWarnError(bool includeOld = true)
 
   telnetClient.println("\n-- WARN/ERROR --");
   if (includeOld)
-    telnetPrintWarnErrorFile("/log.old");
-  telnetPrintWarnErrorFile("/log.txt");
+    telnetPrintWarnErrorFile(LOG_OLD_FILE);
+  telnetPrintWarnErrorFile(LOG_FILE);
   // telnetClient.println("-- EOF --\n");
 }
 
@@ -1045,22 +985,19 @@ static void telnetWelcome()
 // sensori
 void leggiSensori(int umidita[2])
 {
-  const int NUM_SAMPLES = 5;           // Numero di campioni per media
-  const int DELAY_BETWEEN_SAMPLES = 5; // 5ms tra letture
-
   long sum1 = 0;
   long sum2 = 0;
 
-  for (int i = 0; i < NUM_SAMPLES; i++)
+  for (int i = 0; i < SENSOR_NUM_SAMPLES; i++)
   {
     sum1 += analogRead(Pin_Sensore1);
     sum2 += analogRead(Pin_Sensore2);
-    delay(DELAY_BETWEEN_SAMPLES); // Piccolo ritardo tra letture
+    delay(SENSOR_SAMPLE_DELAY_MS); // Piccolo ritardo tra letture
   }
 
   // ✅ Calcola media
-  umidita[0] = sum1 / NUM_SAMPLES;
-  umidita[1] = sum2 / NUM_SAMPLES;
+  umidita[0] = sum1 / SENSOR_NUM_SAMPLES;
+  umidita[1] = sum2 / SENSOR_NUM_SAMPLES;
 
   validazioneSensori(umidita[0], umidita[1]);
 }
@@ -1071,8 +1008,8 @@ void handleSensore(bool toTelegram)
 
   leggiSensori(umidita);
 
-  int umiditaSens1 = map(umidita[0], ADC_DRY, ADC_WET, 0, 100);
-  int umiditaSens2 = map(umidita[1], ADC_DRY, ADC_WET, 0, 100);
+  int umiditaSens1 = map(umidita[0], SENSOR_DRY_ADC, SENSOR_WET_ADC, 0, 100);
+  int umiditaSens2 = map(umidita[1], SENSOR_DRY_ADC, SENSOR_WET_ADC, 0, 100);
 
   umiditaSens1 = constrain(umiditaSens1, 0, 100);
   umiditaSens2 = constrain(umiditaSens2, 0, 100);
@@ -1134,7 +1071,6 @@ void handleSensore(bool toTelegram)
   // cooldown log "richiesta ma bloccato"
   static uint32_t lastBlockedLog1 = 0;
   static uint32_t lastBlockedLog2 = 0;
-  const uint32_t BLOCK_LOG_COOLDOWN_MS = 20UL * 60UL * 1000UL; // 10 min
 
   const bool mot1On = (offTimeMot1 != 0);
   const bool mot2On = (offTimeMot2 != 0);
@@ -1184,9 +1120,6 @@ void handleSensore(bool toTelegram)
   static int lastLoggedPct1 = -1;
   static int lastLoggedPct2 = -1;
   static uint32_t lastHumLogMs = 0;
-
-  const uint32_t HUM_LOG_INTERVAL_MS = 20UL * 60UL * 1000UL; // 20 min
-  const int HUM_DELTA_PCT = 5;
 
   int d1 = (lastLoggedPct1 < 0) ? 999 : abs(umiditaSens1 - lastLoggedPct1);
   int d2 = (lastLoggedPct2 < 0) ? 999 : abs(umiditaSens2 - lastLoggedPct2);
@@ -1644,7 +1577,7 @@ void handleMessage(String text, String chatId, String messageId)
   }
   if (text == "/clearlog")
   {
-    SPIFFS.remove("/log.txt");
+    SPIFFS.remove(LOG_FILE);
     tgSend("Log cancellato.");
     return;
   }
@@ -1737,7 +1670,7 @@ bool rilevoMeteo()
   String url;
   url.reserve(256);
   url = "https://api.openweathermap.org/data/2.5/weather?q=";
-  url += city;
+  url += CITY;
   url += "&appid=";
   url += openWeatherMapApiKey;
   url += "&units=metric&lang=it";
@@ -1789,7 +1722,7 @@ bool rilevoMeteo()
   float r1h = doc["rain"]["1h"] | 0.0f;
   float r3h = doc["rain"]["3h"] | 0.0f;
 
-  bool piove = (main == "Rain" || main == "Drizzle" || r1h >= soglia_Minima_Pioggia);
+  bool piove = (main == "Rain" || main == "Drizzle" || r1h >= SOGLIA_MINIMA_PIOGGIA_MM);
 
   meteo.condizioniMeteo = main;
   meteo.temperatura = temp;
@@ -1804,9 +1737,9 @@ bool rilevoMeteo()
 
 unsigned long refreshData(int ora)
 { // restituisce l'intervallo di refresh appropiato
-  if (ora >= ora_Inizio_Giorno && ora <= ora_Fine_Giorno)
-    return intervallo_Refresh_Giorno;
-  return intervallo_Refresh_Notte;
+  if (ora >= ORA_INIZIO_GIORNO && ora <= ORA_FINE_GIORNO)
+    return INTERVALLO_REFRESH_GIORNO_MS;
+  return INTERVALLO_REFRESH_NOTTE_MS;
 }
 
 bool validitaCashMeteo()
@@ -1814,7 +1747,7 @@ bool validitaCashMeteo()
   if (!meteo.datiValidi)
     return false;
   unsigned long elapsed = millis() - meteo.ultimoAggiornamento;
-  return elapsed <= durata_Cash_Valida;
+  return elapsed <= DURATA_CACHE_METEO_MS;
 }
 
 bool aggiornamentoMeteoServe(bool forza = false)
@@ -1829,7 +1762,7 @@ bool aggiornamentoMeteoServe(bool forza = false)
 void attivoBloccoPioggia()
 {
   bloccoIrrigazione = true;
-  scadenzaBloccoIrrigazione = millis() + DurataBloccoPioggia;
+  scadenzaBloccoIrrigazione = millis() + DURATA_BLOCCO_PIOGGIA_MS;
 }
 
 void controlloBloccoPioggia()
@@ -1875,7 +1808,7 @@ void handleMeteo()
   msg.reserve(650);
 
   // Header
-  msg += "🌤️ METEO — " + city + "\n";
+  msg += "🌤️ METEO — " + String(CITY) + "\n";
   msg += "━━━━━━━━━━━━━━\n";
 
   // Dati attuali
@@ -1897,7 +1830,7 @@ void handleMeteo()
     msg += " (" + String(meteo.mmPrevisti6h, 2) + " mm)\n";
 
     // Nota soglia (usa il nome reale della tua costante: sogliaMinimaPioggia nel file)
-    msg += "• Soglia: ≥ " + String(soglia_Minima_Pioggia, 1) + " mm\n";
+    msg += "• Soglia: ≥ " + String(SOGLIA_MINIMA_PIOGGIA_MM, 1) + " mm\n";
   }
   else
   {
@@ -1931,7 +1864,7 @@ void handleMeteo()
 static inline bool isRainLike(float mm3h, const String &main)
 {
   // Soglia principale: mm negli ultimi 3h previsti
-  if (mm3h >= soglia_Minima_Pioggia)
+  if (mm3h >= SOGLIA_MINIMA_PIOGGIA_MM)
     return true;
   // Fallback (utile quando "rain.3h" non c'è ma la condizione è Rain/Drizzle)
   if (main == "Rain" || main == "Drizzle")
@@ -1943,7 +1876,7 @@ bool validitaCacheForecast()
 {
   if (!meteo.forecastValidi)
     return false;
-  return (millis() - meteo.ultimoAggForecast) < durataCacheForecast;
+  return (millis() - meteo.ultimoAggForecast) < DURATA_CACHE_FORECAST_MS;
 }
 
 bool aggiornamentoForecastServe(bool forza)
@@ -1967,7 +1900,7 @@ bool rilevoForecastPioggia()
   // OpenWeatherMap supporta cnt per limitare il numero di elementi in "list". [page:0]
   String url;
   url.reserve(256);
-  url = "http://api.openweathermap.org/data/2.5/forecast?q=" + city +
+  url = "http://api.openweathermap.org/data/2.5/forecast?q=" + String(CITY) +
         "&appid=" + openWeatherMapApiKey + "&units=metric&lang=it&cnt=3";
 
   HTTPClient http;
@@ -2268,8 +2201,8 @@ void validazioneSensori(int raw1, int raw2)
   // check umidita critica
   if (!sensor1Error && !sensor2Error)
   {
-    int pct1 = map(constrain(raw1, ADC_WET, ADC_DRY), ADC_DRY, ADC_WET, 0, 100);
-    int pct2 = map(constrain(raw2, ADC_WET, ADC_DRY), ADC_DRY, ADC_WET, 0, 100);
+    int pct1 = map(constrain(raw1, SENSOR_WET_ADC, SENSOR_DRY_ADC), SENSOR_DRY_ADC, SENSOR_WET_ADC, 0, 100);
+    int pct2 = map(constrain(raw2, SENSOR_WET_ADC, SENSOR_DRY_ADC), SENSOR_DRY_ADC, SENSOR_WET_ADC, 0, 100);
 
     // Umidità sotto 15% su ALMENO UN sensore? → CRITICA
     bool critica = (pct1 < UMIDITA_CRITICA || pct2 < UMIDITA_CRITICA);
@@ -3054,8 +2987,8 @@ static inline bool isNightHour(int h) // Ritorna true se l'ora è nella fascia N
   if (h < 0 || h > 23)
     return true;
 
-  const int start = ora_Inizio_Giorno;
-  const int end = ora_Fine_Giorno;
+  const int start = ORA_INIZIO_GIORNO;
+  const int end = ORA_FINE_GIORNO;
 
   // Caso normale: giorno è [start..end]
   if (start <= end)
