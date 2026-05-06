@@ -678,7 +678,8 @@ static void telnetWelcome()
   telnetClient.println("=== END ===");
 }
 
-// sensori
+// sensori - spostato in sensori.cpp
+/*
 void leggiSensori(int umidita[2])
 {
   long sum1 = 0;
@@ -697,6 +698,7 @@ void leggiSensori(int umidita[2])
 
   validazioneSensori(umidita[0], umidita[1]);
 }
+*/
 
 void handleSensore(bool toTelegram)
 {

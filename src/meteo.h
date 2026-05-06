@@ -23,4 +23,4 @@ extern DatiMeteo meteo;
 bool rilevoMeteo();
 bool rilevoForecastPioggia();
 void handleMeteo();
-bool irrigazioneConsentita(uint32_t nowMs, String &motivo);
+bool irrigazioneConsentita();

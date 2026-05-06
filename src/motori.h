@@ -33,7 +33,7 @@ extern AutoZone az1, az2;
 bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source,
                        IrrigationBlockReason &reason, uint8_t &motBlocked,
                        uint16_t &waitMin, bool ignoreMeteo = false);
-bool motorsOnNow();
+// motorsOnNow() è definita inline in utils.h
 String motorLabel(uint8_t m);
 void spegniMotori(uint8_t m);
 void checkMotori(uint32_t now);

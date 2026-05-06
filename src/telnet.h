@@ -1,3 +1,3 @@
 #pragma once
 
-bool telnetOnNow();
+// telnetOnNow() è definita inline in utils.h

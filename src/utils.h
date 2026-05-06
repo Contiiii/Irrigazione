@@ -1,11 +1,15 @@
 
 #pragma once
 #include <Arduino.h>
+#include <WiFi.h>
 
 // Variabili esterne definite in main.cpp
 extern uint32_t offTimeMot1;
 extern uint32_t offTimeMot2;
 extern WiFiClient telnetClient;
+
+// Funzioni dai sensori
+void handleSensore(bool toTelegram);
 
 inline String motorLabel(uint8_t m) {
   if (m == 1) return "1";

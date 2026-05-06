@@ -1,6 +1,3 @@
 #include "telnet.h"
 
-bool telnetOnNow()
-{
-  return false; // stub: telnet non ancora implementato
-}
+// telnetOnNow() è definita inline in utils.h

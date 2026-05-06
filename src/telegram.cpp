@@ -8,11 +8,6 @@
 #include "utils.h"
 #include <esp_wifi.h>
 
-// Da sensori.h (non ancora creato)
-void handleSensore(bool forced);
-// Da telnet.h (non ancora creato)
-bool telnetOnNow();
-
 // Da main.cpp / stats
 extern long lastHandledUpdateId;
 
