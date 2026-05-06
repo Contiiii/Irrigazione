@@ -16,6 +16,8 @@
 #include "log.h"
 #include "telegram.h"
 #include "utils.h"
+#include "sensori.h"
+#include "health.h"
 
 // ========================= ENUM (stati/cause) =========================
 enum MotorSel
@@ -58,6 +60,8 @@ struct DatiMeteo
   float mmPrevisti6h = 0.0f;           // mm previsione entro 6h (slot considerati).
 };
 
+// struct SystemHealth - spostata in health.h
+/*
 struct SystemHealth
 {
   bool sensore1Disconnesso : 1; // Sensore 1 fuori range/assente.
@@ -81,7 +85,7 @@ struct SystemHealth
   bool motore1BloccatoSicurezza = false; // Motore 1 bloccato
   bool motore2BloccatoSicurezza = false; // Motore 2 bloccato
 
-  bool irrigazioniTroppoFrequenti : 1; // Flag “troppo frequente” (se usato nei controlli).
+  bool irrigazioniTroppoFrequenti : 1; // Flag "troppo frequente" (se usato nei controlli).
 
   uint8_t irrigazioniOggiMot1; // Conteggio irrigazioni oggi (motore 1).
   uint8_t irrigazioniOggiMot2; // Conteggio irrigazioni oggi (motore 2).
@@ -107,6 +111,7 @@ struct SystemHealth
   uint32_t pollDelayMs; // delay corrente
   bool pollBoostActive; // true se sei in boost
 };
+*/
 
 struct AutoZone
 {
@@ -678,8 +683,7 @@ static void telnetWelcome()
   telnetClient.println("=== END ===");
 }
 
-// sensori - spostato in sensori.cpp
-/*
+// sensori
 void leggiSensori(int umidita[2])
 {
   long sum1 = 0;
@@ -698,7 +702,6 @@ void leggiSensori(int umidita[2])
 
   validazioneSensori(umidita[0], umidita[1]);
 }
-*/
 
 void handleSensore(bool toTelegram)
 {

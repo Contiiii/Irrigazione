@@ -8,9 +8,6 @@ extern uint32_t offTimeMot1;
 extern uint32_t offTimeMot2;
 extern WiFiClient telnetClient;
 
-// Funzioni dai sensori
-void handleSensore(bool toTelegram);
-
 inline String motorLabel(uint8_t m) {
   if (m == 1) return "1";
   if (m == 2) return "2";

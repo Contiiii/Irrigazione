@@ -6,6 +6,7 @@
 #include "motori.h"
 #include "meteo.h"
 #include "utils.h"
+#include "sensori.h"
 #include <esp_wifi.h>
 
 // Da main.cpp / stats
