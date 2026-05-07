@@ -24,3 +24,9 @@ bool rilevoMeteo();
 bool rilevoForecastPioggia();
 void handleMeteo();
 bool irrigazioneConsentita();
+
+// Funzioni meteo locale
+bool aggiornamentoMeteoServe(bool forza = false);
+void controlloBloccoPioggia();
+bool aggiornamentoForecastServe(bool forza = false);
+void applicaBloccoDaForecast();

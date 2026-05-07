@@ -242,7 +242,7 @@ void handleMeteo();
 // previsioni ore successive - NON in meteo.h
 bool rilevoForecastPioggia();
 bool validitaCacheForecast();
-bool aggiornamentoForecastServe(bool forza = false);
+bool aggiornamentoForecastServe(bool forza);
 void applicaBloccoDaForecast();
 
 // check sistem Health - già in health.h
@@ -1077,7 +1077,7 @@ bool validitaCashMeteo()
   return elapsed <= DURATA_CACHE_METEO_MS;
 }
 
-bool aggiornamentoMeteoServe(bool forza = false)
+bool aggiornamentoMeteoServe(bool forza)
 {
   if (forza || !validitaCashMeteo())
   {
@@ -1498,6 +1498,8 @@ void validazioneSensori(int raw1, int raw2)
   if (sensor1Error && !lastSensor1Error)
   {
     health.sensore1Disconnesso = true;
+    // TODO Fase 5: sostituire questa chiamata diretta con flag di ritorno
+    // per eliminare la dipendenza ciclica sensori → motori prima dell'estrazione
     spegniMotori(1);
     logLine(WARN, "⚠️ Sensore 1 disconnesso (val: " + String(raw1) + ")", true, true);
   }
@@ -1515,6 +1517,8 @@ void validazioneSensori(int raw1, int raw2)
   if (sensor2Error && !lastSensor2Error)
   {
     health.sensore2Disconnesso = true;
+    // TODO Fase 5: sostituire questa chiamata diretta con flag di ritorno
+    // per eliminare la dipendenza ciclica sensori → motori prima dell'estrazione
     spegniMotori(2);
     logLine(WARN, "⚠️ Sensore 2 disconnesso (val: " + String(raw2) + ")", true, true);
   }

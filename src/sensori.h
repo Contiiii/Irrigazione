@@ -1,13 +1,10 @@
 #pragma once
 #include <Arduino.h>
 #include "config.h"
+#include "health.h"
 
 // Modulo lettura sensori umidità terreno.
 // Interfaccia pubblica: leggiSensori(), validazioneSensori(), handleSensore().
-
-// Forward declaration di health (definita in health.h e main.cpp)
-struct SystemHealth;
-extern SystemHealth health;
 
 // Legge i sensori di umidità e ritorna i valori raw ADC.
 // Pre-condizione: array umidita[2] passato dal chiamante.

@@ -33,7 +33,10 @@ extern AutoZone az1, az2;
 bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source,
                        IrrigationBlockReason &reason, uint8_t &motBlocked,
                        uint16_t &waitMin, bool ignoreMeteo = false);
-// motorsOnNow() è definita inline in utils.h
+// motorsOnNow() e' definita inline in utils.h
 String motorLabel(uint8_t m);
-void spegniMotori(uint8_t m);
+void accendiMotori(int who, int tempo);
+void spegniMotori(int who);
+void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk);
+// armStateTimeout() appartiene a telegram.h, non a questo modulo
 void checkMotori(uint32_t now);
