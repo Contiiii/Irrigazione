@@ -8,7 +8,6 @@ enum LogLevel { INFO, DEBUG_L, WARN, ERROR_L };
 
 // Stato globale (extern: definiti in log.cpp)
 extern bool spiffsOK;
-extern size_t logBytes;
 extern bool debug;
 extern bool timeReady;
 

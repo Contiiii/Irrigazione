@@ -1626,8 +1626,7 @@ void checkWiFiSignal(uint32_t now)
     {
       reconnecting = true;
       reconnectStartMs = now;
-      WiFi.disconnect();
-      delay(10);
+      WiFi.disconnect(true); // true: svuota buffer credenziali, non serve delay
       WiFi.begin(ssid, password);
       logLine(WARN, "🔄📡 Reconnessione WiFi avviata...", true, false);
     }

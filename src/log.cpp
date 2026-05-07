@@ -68,8 +68,7 @@ void logLine(LogLevel lvl, const String &msg, bool newline, bool toTelegram)
     Serial.print(line);
     if (newline) Serial.print("\r\n");
 
-    // Telnet (dichiarato extern per evitare include circolare)
-    extern WiFiClient telnetClient;
+    // Telnet (usando utils.h che già dichiara telnetClient)
     if (telnetClient && telnetClient.connected()) {
         telnetClient.print(line);
         if (newline) telnetClient.print("\r\n");

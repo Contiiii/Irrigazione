@@ -25,11 +25,6 @@ struct SystemHealth
   int8_t rssi;
   float temperaturaESP32;
   uint16_t spiffsFreeKB;
-  uint8_t irrigazioniOggi;
-  unsigned long lastSensorCheck;
-  unsigned long lastTempCheck;
-  unsigned long lastWifiCheck;
-  unsigned long lastMemoryCheck;
   unsigned long lastIrrigationTime;
   uint32_t lastDayReset;
   unsigned long motore1StartTime;
