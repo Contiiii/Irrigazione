@@ -18,8 +18,12 @@
 #include "utils.h"
 #include "sensori.h"
 #include "health.h"
+#include "motori.h"
+#include "meteo.h"
+#include "telnet.h"
 
-// ========================= ENUM (stati/cause) =========================
+// Tipi condivisi - spostati negli header dedicati
+/*
 enum MotorSel
 {
   Motore_1 = 1,
@@ -35,13 +39,15 @@ enum IrrigationBlockReason : uint8_t
   IRR_DAY_LIMIT,
   IRR_MOTOR_LOCKED
 }; // Motivo blocco irrigazione.
+*/
 
 // ========================= CONFIG / COSTANTI =========================
 
 RTC_DATA_ATTR uint32_t bootCounter = 0; // Contatore boot in RTC memory (persistente).
 
 
-// ========================= STRUTTURE DATI =========================
+// Tipi condivisi - spostati negli header dedicati
+/*
 struct DatiMeteo
 {
   bool staPiovendo;                  // True se sta piovendo ora (condizione o mm/h).
@@ -59,6 +65,7 @@ struct DatiMeteo
   float mmPrevisti3h = 0.0f;           // mm previsione entro 3h (slot considerati).
   float mmPrevisti6h = 0.0f;           // mm previsione entro 6h (slot considerati).
 };
+*/
 
 // struct SystemHealth - spostata in health.h
 /*
@@ -113,12 +120,15 @@ struct SystemHealth
 };
 */
 
+// struct AutoZone - spostata in motori.h
+/*
 struct AutoZone
 {
-  bool active = false;  // True se AUTO ha avviato irrigazione (zona “attiva”).
+  bool active = false;  // True se AUTO ha avviato irrigazione (zona "attiva").
   uint8_t startTh = 25; // %: sotto/uguale -> avvia.
   uint8_t stopTh = 30;  // %: sopra/uguale -> ferma.
 };
+*/
 
 struct DailyStats
 {
@@ -185,7 +195,7 @@ String telnetLine;           // Buffer riga comandi Telnet.
 unsigned long lastTelegramMs = 0;                    // millis() ultimo invio messaggio (anti-spam).
 
 long lastHandledUpdateId = 0;                       // Ultimo update_id gestito (anti-doppio).
-unsigned long lastMotorCommandTime = 0;             // millis() ultimo comando motore (debounce).
+uint32_t lastMotorCommandTime = 0;             // millis() ultimo comando motore (debounce).
 
 static uint32_t stateTimeoutMs = 0;               // millis() scadenza attesa risposta durata.
 
@@ -199,7 +209,7 @@ static uint8_t tgSendCounter = 0;            // per debug duplicati
 // ✅ LOCK per evitare che safeGetUpdates() e tgSend() corrano in parallelo
 static volatile bool tgBusy = false;
 
-// Prototipi di telnet
+// Prototipi di telnet - già in telnet.h, ma telnetWelcome è static
 void handleTelnet();
 void handleTelnetCommand(const String &cmd);
 void telnetSendTail(const char *path, int maxLines);
@@ -207,17 +217,19 @@ void telnetPrintWarnErrorFile(const char *path);
 void telnetPrintAllWarnError(bool includeOld);
 static void telnetWelcome();
 
-// Prototipi dei sensori
+// Prototipi dei sensori - già in sensori.h
+/*
 void leggiSensori(int umidita[2]);
 void handleSensore(bool toTelegram);
+*/
 
-// Prototipi dei motori
+// Prototipi dei motori - NON in header, tenuti qui
 void accendiMotori(int who, int tempo);
 void spegniMotori(int who);
 void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk);
 void armStateTimeout(uint32_t windowMs);
 
-// Rilevo meteo
+// Rilevo meteo - già in meteo.h
 bool rilevoMeteo();
 unsigned long refreshData(int ora);
 bool validitaCashMeteo();
@@ -227,13 +239,13 @@ void controlloBloccoPioggia();
 bool irrigazioneConsentita();
 void handleMeteo();
 
-// previsioni ore successive
+// previsioni ore successive - NON in meteo.h
 bool rilevoForecastPioggia();
 bool validitaCacheForecast();
 bool aggiornamentoForecastServe(bool forza = false);
 void applicaBloccoDaForecast();
 
-// check sistem Health
+// check sistem Health - già in health.h
 void validazioneSensori(int raw1, int raw2);
 void checkTemperaturaESP32(uint32_t now);
 void handleHealth();
@@ -242,10 +254,10 @@ void checkTelegramConnection(uint32_t now);
 void checkMemory(uint32_t now);
 void checkMotori(uint32_t now);
 
-// check irrigazioni
+// check irrigazioni - NON in header
 uint32_t computeDayId();
 void dailyResetTick(uint32_t nowMs);
-bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, IrrigationBlockReason &reason, uint8_t &motBlocked, uint16_t &waitMin, bool ignoreMeteo = false);
+bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, IrrigationBlockReason &reason, uint8_t &motBlocked, uint16_t &waitMin, bool ignoreMeteo);
 
 // funzione Helper per log
 static inline String boolToEmoji(bool v, bool inverted = false);
@@ -648,7 +660,7 @@ void telnetPrintWarnErrorFile(const char *path)
   f.close();
 }
 
-void telnetPrintAllWarnError(bool includeOld = true)
+void telnetPrintAllWarnError(bool includeOld)
 {
   if (!(telnetClient && telnetClient.connected()))
     return;
@@ -2073,7 +2085,7 @@ void nightlyReportTick(uint32_t nowMs)
   // Se sono in finestra e l’ultimo tentativo è fallito, riprova più spesso.
   if (lastAttemptFailedInWindow)
   {
-    nextCheckMs = nowMs + 60000UL; // retry ogni 15s dentro la finestra
+    nextCheckMs = nowMs + 15000UL; // retry ogni 15s dentro la finestra
   }
 
   const uint32_t dayId = computeDayId();
