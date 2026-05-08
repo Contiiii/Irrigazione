@@ -1,6 +1,6 @@
 #include "log.h"
-#include "telegram.h" 
-#include "utils.h"  // solo per tgSend() nei logLine con toTelegram=true
+#include "utils.h"   // per telnetClient
+#include "telegram.h" // per tgSend()
 
 // ── Variabili globali di questo modulo ──────────────────────────────
 bool   spiffsOK  = false;
