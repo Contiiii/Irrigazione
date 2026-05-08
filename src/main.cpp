@@ -1615,17 +1615,6 @@ void checkMotori(uint32_t now)
   }
 }
 
-// check irrigazioni
-uint32_t computeDayId()
-{
-  if (!timeReady)
-    return 0;
-  struct tm t;
-  if (!getLocalTime(&t, 50))
-    return 0;
-  return (uint32_t)(t.tm_year + 1900) * 400UL + (uint32_t)t.tm_yday;
-}
-
 void dailyResetTick(uint32_t nowMs)
 {
   // Rate-limit: esegui al massimo 1 volta/minuto (overflow-safe)
