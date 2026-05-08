@@ -206,8 +206,7 @@ static uint32_t tgLastSendMs = 0;            // ultimo invio OK
 static String tgLastPayload = "";            // ultimo messaggio inviato
 static uint8_t tgSendCounter = 0;            // per debug duplicati
 
-// ✅ LOCK per evitare che safeGetUpdates() e tgSend() corrano in parallelo
-static volatile bool tgBusy = false;
+// ✅ LOCK per evitare che safeGetUpdates() e tgSend() corrano in parallelo (definito in telegram.cpp)
 
 // Prototipi di telnet - già in telnet.h, ma telnetWelcome è static
 void handleTelnet();
@@ -215,7 +214,6 @@ void handleTelnetCommand(const String &cmd);
 void telnetSendTail(const char *path, int maxLines);
 void telnetPrintWarnErrorFile(const char *path);
 void telnetPrintAllWarnError(bool includeOld);
-static void telnetWelcome();
 
 // Prototipi dei sensori - già in sensori.h
 /*
@@ -474,226 +472,20 @@ void loop()
 
 // telnet
 
-void handleTelnet()
-{
+// ESTRATTA in telnet.cpp — Fase 4C
+void handleTelnet();
 
-  if (telnetServer.hasClient())
-  {
-    WiFiClient newClient = telnetServer.available();
-    if (newClient)
-    {
-      boostPolling(BOOST_TELNET_MS);
-      if (telnetClient && telnetClient.connected())
-        telnetClient.stop();
-      telnetClient = newClient;
-      telnetClient.println("Telnet OK. Comandi: tail, alert, clear, size, tgreset, health");
-      telnetWelcome();
-    }
-  }
+// ESTRATTA in telnet.cpp — Fase 4C
+void handleTelnetCommand(const String &cmd);
 
-  if (!(telnetClient && telnetClient.connected()))
-    return;
+// ESTRATTA in telnet.cpp — Fase 4A
+void telnetSendTail(const char *path, int maxLines);
 
-  if (telnetClient && telnetClient.connected())
-  {
-    boostPolling(2000); // piccolo rinnovo continuo, leggero
-  }
+// ESTRATTA in telnet.cpp — Fase 4A
+void telnetPrintWarnErrorFile(const char *path);
 
-  while (telnetClient.available())
-  {
-    uint8_t c = (uint8_t)telnetClient.read();
-
-    // Telnet: IAC (255) introduce comandi/negoziazione, non testo [web:494]
-    if (c == 0xFF)
-    {
-      // spesso: IAC + (DO/DONT/WILL/WONT) + option => 3 byte totali [web:482]
-      if (telnetClient.available())
-        telnetClient.read();
-      if (telnetClient.available())
-        telnetClient.read();
-      continue;
-    }
-
-    // Ignora NUL (può arrivare in alcune varianti CR NUL)
-    if (c == 0x00)
-      continue;
-
-    // Fine riga: accetta CR o LF
-    if (c == '\r' || c == '\n')
-    {
-      telnetLine.trim();
-      if (telnetLine.length() > 0)
-        handleTelnetCommand(telnetLine);
-      telnetLine = "";
-      continue;
-    }
-
-    // Backspace (utile con PuTTY/iTerminal quando modifichi la riga)
-    if (c == 0x08 || c == 0x7F)
-    {
-      if (telnetLine.length() > 0)
-        telnetLine.remove(telnetLine.length() - 1);
-      continue;
-    }
-
-    telnetLine += (char)c;
-  }
-}
-
-void handleTelnetCommand(const String &cmd)
-{
-  if (cmd.startsWith("tail"))
-  {
-    String arg = cmd.substring(4); // dopo "tail"
-    arg.trim();
-    arg.replace("[", "");
-    arg.replace("]", "");
-    int n = arg.toInt();
-    if (n <= 0)
-      n = 50;
-    telnetSendTail(LOG_FILE, n);
-  }
-  else if (cmd == "tgreset")
-  {
-    lastHandledUpdateId = 0;
-    lastHandledUpdateIdRTC = 0;
-    tgBusy = false;
-    client.stop();
-    telnetClient.println("OK - Telegram offset reset to 0");
-  }
-  else if (cmd == "clear")
-  {
-    SPIFFS.remove(LOG_FILE);
-    telnetClient.println("OK cleared.");
-  }
-  else if (cmd == "health")
-  {
-    handleHealth();
-    return;
-  }
-  else if (cmd == "size")
-  {
-    File f = SPIFFS.open(LOG_FILE, FILE_READ);
-    telnetClient.printf("log.txt = %u bytes\r\n", f ? (unsigned)f.size() : 0);
-    if (f)
-      f.close();
-  }
-  else if (cmd.startsWith("alert"))
-  {
-    bool includeOld = true; // default: include anche log.old
-    if (cmd.indexOf(" new") >= 0)
-      includeOld = false;
-
-    telnetPrintAllWarnError(includeOld); // funzione che ti ho dato prima
-  }
-  else
-  {
-    telnetClient.println("Comandi: tail, alert, clear, size, tgreset, health");
-  }
-}
-
-void telnetSendTail(const char *path, int maxLines)
-{
-  File f = SPIFFS.open(path, FILE_READ);
-  if (!f)
-  {
-    telnetClient.println("No file.");
-    return;
-  }
-
-  maxLines = min(maxLines, 100); // Limite hard ridotto
-
-  // ✅ Alloca dinamicamente (liberato a fine funzione)
-  String *lines = new String[maxLines];
-  if (!lines)
-  {
-    telnetClient.println("Out of memory");
-    f.close();
-    return;
-  }
-
-  int idx = 0;
-  while (f.available())
-  {
-    lines[idx % maxLines] = f.readStringUntil('\n');
-    idx++;
-  }
-  f.close();
-
-  int start = max(0, idx - maxLines);
-  for (int i = start; i < idx; i++)
-  {
-    telnetClient.println(lines[i % maxLines]);
-  }
-
-  delete[] lines; // ✅ Libera memoria
-  telnetClient.println("-- EOF --");
-}
-
-void telnetPrintWarnErrorFile(const char *path)
-{
-  if (!(telnetClient && telnetClient.connected()))
-    return;
-
-  File f = SPIFFS.open(path, FILE_READ);
-  if (!f)
-  {
-    telnetClient.println("No file.");
-    return;
-  }
-
-  char line[512];
-  while (f.available())
-  {
-    size_t n = f.readBytesUntil('\n', line, sizeof(line) - 1);
-    line[n] = '\0';
-
-    // pulizia CR finale (log su file spesso ha \r\n)
-    if (n && line[n - 1] == '\r')
-      line[n - 1] = '\0';
-
-    if (strstr(line, " | W | ") || strstr(line, " | E | "))
-    {
-      telnetClient.println(line);
-    }
-  }
-  f.close();
-}
-
-void telnetPrintAllWarnError(bool includeOld)
-{
-  if (!(telnetClient && telnetClient.connected()))
-    return;
-
-  telnetClient.println("\n-- WARN/ERROR --");
-  if (includeOld)
-    telnetPrintWarnErrorFile(LOG_OLD_FILE);
-  telnetPrintWarnErrorFile(LOG_FILE);
-  // telnetClient.println("-- EOF --\n");
-}
-
-static void telnetWelcome()
-{
-  if (!telnetClient || !telnetClient.connected())
-    return;
-
-  telnetClient.println();
-  telnetClient.println("=== ESP32 TELNET ===");
-  telnetClient.println("IP: " + WiFi.localIP().toString());
-  telnetClient.println("Uptime(ms): " + String(millis()));
-  telnetClient.println("Comandi: tail [n], alert, clear, size");
-
-  if (!spiffsOK)
-  {
-    telnetClient.println("SPIFFS non montato, niente log.");
-    telnetClient.println("=== END ===");
-    return;
-  }
-
-  telnetPrintAllWarnError(true);
-
-  telnetClient.println("=== END ===");
-}
+// ESTRATTA in telnet.cpp — Fase 4B
+void telnetPrintAllWarnError(bool includeOld);
 
 // sensori
 void leggiSensori(int umidita[2])

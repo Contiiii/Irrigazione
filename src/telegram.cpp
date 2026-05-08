@@ -21,7 +21,7 @@ BotState botstate = IDLE;
 bool motorOperationInProgress = false;
 
 // ── Variabili interne ────────────────────────────────────────────────
-static volatile bool tgBusy = false;
+volatile bool tgBusy = false;
 static uint32_t tgLastSendMs = 0;
 static uint32_t pollBoostUntilMs = 0;
 static uint32_t nextPollMs = 0;
