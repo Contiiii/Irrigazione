@@ -130,26 +130,6 @@ struct AutoZone
 };
 */
 
-struct DailyStats
-{
-  uint16_t warnCount = 0; // Warning accumulati oggi.
-  uint16_t errCount = 0;  // Errori accumulati oggi.
-
-  uint16_t humMin1 = 101, humMax1 = 0; // Min/max umidità % vaso 1.
-  uint32_t humSum1 = 0;                // Somma umidità % vaso 1 (media).
-  uint16_t humN1 = 0;                  // Numero campioni vaso 1.
-
-  uint16_t humMin2 = 101, humMax2 = 0; // Min/max umidità % vaso 2.
-  uint32_t humSum2 = 0;                // Somma umidità % vaso 2.
-  uint16_t humN2 = 0;                  // Numero campioni vaso 2.
-
-  uint16_t irrCount1 = 0, irrCount2 = 0; // Numero irrigazioni oggi motore 1/2.
-  uint32_t irrSec1 = 0, irrSec2 = 0;     // Secondi irrigati oggi motore 1/2.
-
-  uint16_t blockRain = 0, blockTooSoon = 0, blockDayLimit = 0; // Conteggio blocchi per causa.
-
-  uint32_t lastReportDayId = 0; // DayId ultimo report notturno inviato.
-};
 
 // ========================= ISTANZE / STATO RUNTIME =========================
 MotorSel pendingMotor = Motore_1; // Motore selezionato, in attesa durata.
@@ -170,7 +150,7 @@ uint32_t offTimeMot2 = 0;
 
 bool manutenzione = false; // Modalità manutenzione (se la usi per bypass).
 
-static DailyStats stats; // Statistiche giornaliere.
+DailyStats stats; // Statistiche giornaliere. // Statistiche giornaliere.
 
 static uint32_t pollBoostUntilMs = 0; // fino a quando restare in boost
 static uint32_t nextPollMs = 0;       // scheduler (al posto di lastTimeBotRan + botRequestDelay)
