@@ -1,5 +1,9 @@
 #pragma once
 #include <Arduino.h>
+#include "config.h"
+#include "health.h"
+#include "log.h"
+#include "sensori.h"
 
 enum MotorSel
 {
