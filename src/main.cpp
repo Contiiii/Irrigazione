@@ -138,7 +138,7 @@ DatiMeteo meteo;                             // Meteo attuale + forecast.
 bool bloccoIrrigazione = false;              // True se irrigazione bloccata (pioggia/forecast).
 unsigned long scadenzaBloccoIrrigazione = 0; // millis() scadenza blocco irrigazione.
 
-static uint32_t g_nextDayCheckMs = 0; // millis() prossimo check cambio-giorno (rate-limit).
+uint32_t g_nextDayCheckMs = 0; // millis() prossimo check cambio-giorno (rate-limit).
 
 SystemHealth health = {}; // Stato salute (flag+valori misurati).
 
