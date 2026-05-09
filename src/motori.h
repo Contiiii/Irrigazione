@@ -33,6 +33,9 @@ extern uint32_t offTimeMot2;
 extern uint32_t lastMotorCommandTime;
 extern MotorSel pendingMotor;
 extern AutoZone az1, az2;
+extern bool autoEnabled;
+extern bool bloccoIrrigazione;
+extern bool manutenzione;
 
 bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source,
                        IrrigationBlockReason &reason, uint8_t &motBlocked,
