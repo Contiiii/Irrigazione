@@ -4,6 +4,10 @@
 #include "health.h"
 #include "log.h"
 #include "sensori.h"
+#include "utils.h"
+#include "telegram.h"
+#include "meteo.h"
+#include "scheduler.h"
 
 enum MotorSel
 {
