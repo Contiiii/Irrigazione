@@ -30,6 +30,46 @@ static uint32_t nextWifiPolicyMs = 0;
 static uint32_t stateTimeoutMs = 0;
 
 
+void handleTelegramPolling(uint32_t now, int hourNow)
+{
+  uint32_t delayMs = currentPollDelayMs(hourNow, now);
+  wifiFollowPolling(now, delayMs);
+
+  health.pollDelayMs    = delayMs;
+  health.pollBoostActive = isBoostedNow(now);
+
+  if ((int32_t)(now - nextPollMs) < 0)
+    return;
+
+  int numNewMessages = safeGetUpdates();
+
+  if (numNewMessages > 0)
+  {
+    boostPolling(BOOST_MSG_MS);
+
+    long maxUid = lastHandledUpdateId;
+
+    for (int i = 0; i < numNewMessages; i++)
+    {
+      long uid = bot.messages[i].update_id;
+      if (uid > maxUid)
+        maxUid = uid;
+
+      String type   = bot.messages[i].type;
+      String text   = bot.messages[i].text;
+      String chatId = bot.messages[i].chat_id;
+
+      if (type == "message")
+        handleMessage(text, chatId, String());
+      else if (type == "callback_query")
+        handleCallBack(text, chatId, String());
+    }
+
+    lastHandledUpdateId = maxUid;
+  }
+
+  nextPollMs = now + delayMs;
+}
 
 void handleCallBack(String text, String chatId, String messageId)
 {

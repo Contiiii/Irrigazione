@@ -21,14 +21,9 @@
 #include "motori.h"
 #include "meteo.h"
 #include "telnet.h"
-#include "sensori.h"
-// Tipi condivisi - spostati negli header dedicati
-
 // ========================= CONFIG / COSTANTI =========================
 
 RTC_DATA_ATTR uint32_t bootCounter = 0; // Contatore boot in RTC memory (persistente).
-
-
 
 // ========================= ISTANZE / STATO RUNTIME =========================
 MotorSel pendingMotor = Motore_1; // Motore selezionato, in attesa durata.
@@ -51,11 +46,6 @@ bool manutenzione = false; // Modalità manutenzione (se la usi per bypass).
 
 DailyStats stats; // Statistiche giornaliere. // Statistiche giornaliere.
 
-static uint32_t pollBoostUntilMs = 0; // fino a quando restare in boost
-static uint32_t nextPollMs = 0;       // scheduler (al posto di lastTimeBotRan + botRequestDelay)
-
-static bool wifiPsOn = false;
-static uint32_t nextWifiPolicyMs = 0;
 
 // ========================= RETE / SERVIZI =========================
 const char *ssid = SECRET_WIFI_SSID;     // SSID WiFi (secrets.h).
@@ -75,55 +65,9 @@ unsigned long lastTelegramMs = 0;                    // millis() ultimo invio me
 
 long lastHandledUpdateId = 0;                       // Ultimo update_id gestito (anti-doppio).
 uint32_t lastMotorCommandTime = 0;             // millis() ultimo comando motore (debounce).
-
-static uint32_t stateTimeoutMs = 0;               // millis() scadenza attesa risposta durata.
+             // millis() scadenza attesa risposta durata.
 
 RTC_DATA_ATTR long lastHandledUpdateIdRTC = 0; // Persistente!
-
-// da sistemare
-static uint32_t tgLastSendMs = 0;            // ultimo invio OK
-static String tgLastPayload = "";            // ultimo messaggio inviato
-static uint8_t tgSendCounter = 0;            // per debug duplicati
-
-// ✅ LOCK per evitare che safeGetUpdates() e tgSend() corrano in parallelo (definito in telegram.cpp)
-
-// Prototipi di telnet - già in telnet.h, ma telnetWelcome è static
-void handleTelnet();
-void handleTelnetCommand(const String &cmd);
-void telnetSendTail(const char *path, int maxLines);
-void telnetPrintWarnErrorFile(const char *path);
-void telnetPrintAllWarnError(bool includeOld);
-
-// Prototipi dei sensori - già in sensori.h
-/*
-void leggiSensori(int umidita[2]);
-void handleSensore(bool toTelegram);
-*/
-
-// Prototipi dei motori - NON in header, tenuti qui
-void accendiMotori(int who, int tempo);
-void spegniMotori(int who);
-void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk);
-void armStateTimeout(uint32_t windowMs);
-
-
-// check sistem Health - già in health.h
-void checkTelegramConnection(uint32_t now);
-void checkMotori(uint32_t now);
-
-// check irrigazioni - NON in header
-uint32_t computeDayId();
-void dailyResetTick(uint32_t nowMs);
-bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, IrrigationBlockReason &reason, uint8_t &motBlocked, uint16_t &waitMin, bool ignoreMeteo);
-
-// funzione Helper per log
-static inline String boolToEmoji(bool v, bool inverted = false);
-
-// statistiche giornaliere
-void nightlyReportTick(uint32_t nowMs);
-static bool sendNightlyReport();
-static void resetDailyStats();
-
 
 void setup()
 {
@@ -199,26 +143,21 @@ if (WiFi.status() != WL_CONNECTED)
 
 void loop()
 {
-  uint32_t now = millis(); // 1 sola lettura per giro (coerenza + micro ottimizzazione) [web:21]
+  uint32_t now = millis();
 
-  ArduinoOTA.handle(); // se ti serve sempre reattivo, lascialo “sempre” [web:8]
+  ArduinoOTA.handle();
 
-  static uint32_t lastHealth = 0;
   static uint32_t lastSensors = 0;
-  static uint32_t lastHour = 0;
+  static uint32_t lastHour    = 0;
+  static int      hourNow     = 12;
 
-  static int hourNow = 12;
-
-  // Spegnimenti motori (evento urgente) + BLOCCO SICUREZZA al timeout
+  // Spegnimento motori + blocco sicurezza
   if (offTimeMot1 && (int32_t)(now - offTimeMot1) >= 0)
   {
     uint32_t runS = 0;
     if (health.motore1StartTime != 0)
       runS = (now - health.motore1StartTime) / 1000UL;
-
     spegniMotori(1);
-
-    // Se è arrivato al limite, blocca finché non fai sblocca1
     if (runS >= MAX_MOTOR_SECONDS && !health.motore1BloccatoSicurezza)
     {
       health.motore1BloccatoSicurezza = true;
@@ -232,9 +171,7 @@ void loop()
     uint32_t runS = 0;
     if (health.motore2StartTime != 0)
       runS = (now - health.motore2StartTime) / 1000UL;
-
     spegniMotori(2);
-
     if (runS >= MAX_MOTOR_SECONDS && !health.motore2BloccatoSicurezza)
     {
       health.motore2BloccatoSicurezza = true;
@@ -243,10 +180,8 @@ void loop()
     }
   }
 
-  // Telnet: puoi farlo ogni giro o ogni 10–20ms se vuoi alleggerire
   handleTelnet();
 
-  // Healt Cheack
   checkTemperaturaESP32(now);
   checkWiFiSignal(now);
   checkMemory(now);
@@ -261,19 +196,17 @@ void loop()
     tgSend("Richiesta scaduta");
   }
 
-  // Lettura sensori umidità
+  // Sensori umidità
   uint32_t sensInterval = motorsOnNow() ? SENS_IRR_MS : SENS_BASE_MS;
-
   if (debug)
     logLine(DEBUG_L, "DBG off1=" + String(offTimeMot1) + " off2=" + String(offTimeMot2) + " " + String(sensInterval), true, false);
-
   if (now - lastSensors >= sensInterval)
   {
     lastSensors = now;
     handleSensore(false);
   }
 
-  // Ora (hourNow) aggiornata ogni 60s: non serve chiamare getLocalTime “sempre”
+  // Ora locale (aggiornata ogni 60s)
   if (timeReady && (now - lastHour >= 60000))
   {
     lastHour = now;
@@ -282,100 +215,6 @@ void loop()
       hourNow = t.tm_hour;
   }
 
-  // --- Polling Telegram ---
-  uint32_t delayMs = currentPollDelayMs(hourNow, now);
-  wifiFollowPolling(now, delayMs);
-
-  health.pollDelayMs = delayMs;
-  health.pollBoostActive = isBoostedNow(now);
-
-  if ((int32_t)(now - nextPollMs) >= 0)
-  {
-    int numNewMessages = safeGetUpdates();
-
-    if (numNewMessages > 0)
-    {
-      boostPolling(BOOST_MSG_MS);
-
-      long maxUid = lastHandledUpdateId;
-
-      for (int i = 0; i < numNewMessages; i++)
-      {
-        long uid = bot.messages[i].update_id;
-        if (uid > maxUid)
-          maxUid = uid;
-
-        String type = bot.messages[i].type;
-        String text = bot.messages[i].text;
-        String chatId = bot.messages[i].chat_id;
-
-        if (type == "message")
-        {
-          handleMessage(text, chatId, String()); // messageId vuoto
-        }
-        else if (type == "callback_query")
-        {
-          handleCallBack(text, chatId, String()); // messageId vuoto
-        }
-      }
-
-      // ACK di tutti gli update ricevuti (offset = max+1 al giro dopo)
-      lastHandledUpdateId = maxUid;
-    }
-
-    // Scheduler: prossimo polling
-    nextPollMs = now + delayMs;
-  }
+  // Polling Telegram (tutto dentro telegram.cpp)
+  handleTelegramPolling(now, hourNow);
 }
-
-// telnet
-
-// ESTRATTA in telnet.cpp — Fase 4C
-void handleTelnet();
-
-// ESTRATTA in telnet.cpp — Fase 4C
-void handleTelnetCommand(const String &cmd);
-
-// ESTRATTA in telnet.cpp — Fase 4A
-void telnetSendTail(const char *path, int maxLines);
-
-// ESTRATTA in telnet.cpp — Fase 4A
-void telnetPrintWarnErrorFile(const char *path);
-
-// ESTRATTA in telnet.cpp — Fase 4B
-void telnetPrintAllWarnError(bool includeOld);
-
-// motori
-void accendiMotori(int who, int tempo);
-void spegniMotori(int who);
-void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk);
-void checkMotori(uint32_t now);
-
-
-
-
-bool requestIrrigation(MotorSel m, uint16_t seconds, const char *source, IrrigationBlockReason &reason, uint8_t &motBlocked, uint16_t &waitMin, bool ignoreMeteo);
-
-// funzione Helper per log
-static inline String boolToEmoji(bool v, bool inverted)
-{
-  if (inverted)
-    v = !v;
-  return v ? "✅" : "❌";
-}
-
-
-
-/*
-Creare controllo livello acqua
-
-riordinare funzione e variabili
-
-sistemare loop e setup
-
-Utilizzare doppio core
-
-watchdog, freertos
-
-yield();
-*/

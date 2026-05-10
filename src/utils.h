@@ -22,3 +22,6 @@ inline bool motorsOnNow() {
 inline bool telnetOnNow() {
   return telnetClient && telnetClient.connected();
 }
+
+// utils.h
+inline const char* boolToEmoji(bool v) { return v ? "✅" : "❌"; }

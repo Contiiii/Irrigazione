@@ -30,3 +30,5 @@ bool isNightHour(int h);
 bool isStateTimeoutExpired();
 void resetAskSession();
 void armStateTimeout(uint32_t ms);
+
+void handleTelegramPolling(uint32_t now, int hourNow);
