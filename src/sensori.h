@@ -3,6 +3,9 @@
 #include "config.h"
 #include "health.h"
 
+
+String umiditaStatusEmoji(int um);
+
 // Modulo lettura sensori umidità terreno.
 // Interfaccia pubblica: leggiSensori(), validazioneSensori(), handleSensore().
 
