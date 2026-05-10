@@ -63,3 +63,4 @@ void handleHealth();
 void checkTemperaturaESP32(uint32_t now);
 void checkMemory(uint32_t now);
 void checkWiFiSignal(uint32_t now);
+
