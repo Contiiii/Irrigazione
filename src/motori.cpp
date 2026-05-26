@@ -9,33 +9,30 @@ void accendiMotori(int who, int tempo)
 
   if (who == 1)
   {
-    if ((who == 1 || who == 3) && health.motore1BloccatoSicurezza)
-      return;
-    if ((who == 2 || who == 3) && health.motore2BloccatoSicurezza)
-      return;
+    if (health.motore1BloccatoSicurezza) return;
 
     offTimeMot1 = now + (uint32_t)tempo * 1000UL;
-    if (!was1On)
-      health.motore1StartTime = now;
+    if (!was1On) health.motore1StartTime = now;
     health.motore1AttivoTroppoTempo = false;
     digitalWrite(Pin_Relay1, LOW);
   }
   else if (who == 2)
   {
+    if (health.motore2BloccatoSicurezza) return;
+
     offTimeMot2 = now + (uint32_t)tempo * 1000UL;
-    if (!was2On)
-      health.motore2StartTime = now;
+    if (!was2On) health.motore2StartTime = now;
     health.motore2AttivoTroppoTempo = false;
     digitalWrite(Pin_Relay2, LOW);
   }
   else if (who == 3)
   {
+    if (health.motore1BloccatoSicurezza || health.motore2BloccatoSicurezza) return;
+
     offTimeMot1 = now + (uint32_t)tempo * 1000UL;
     offTimeMot2 = now + (uint32_t)tempo * 1000UL;
-    if (!was1On)
-      health.motore1StartTime = now;
-    if (!was2On)
-      health.motore2StartTime = now;
+    if (!was1On) health.motore1StartTime = now;
+    if (!was2On) health.motore2StartTime = now;
     health.motore1AttivoTroppoTempo = false;
     health.motore2AttivoTroppoTempo = false;
     digitalWrite(Pin_Relay1, LOW);
@@ -103,7 +100,7 @@ void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk)
     uint16_t waitM = 0;
     IrrigationBlockReason rr = IRR_OK;
 
-    if (!requestIrrigation(m, MAX_MOTOR_SECONDS, "AUTO", rr, motB, waitM))
+    if (!requestIrrigation(m, MAX_MOTOR_SECONDS, "AUTO", rr, motB, waitM, false))
     {
       logLine(WARN, "⛔ AUTO BLOCCATA mot=" + motorLabel(m) + " reason=" + String((int)rr), true, true);
       return;

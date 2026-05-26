@@ -5,19 +5,8 @@
 #include "motori.h"      // MotorSel, offTimeMot1/2, AutoZone
 #include "scheduler.h"
 
-// ── forward declarations di tipi definiti in main.cpp ──
-struct SystemHealth;
-struct DailyStats;
-
-// ── extern delle variabili globali di main.cpp ──
-extern bool timeReady;
-extern SystemHealth health;
-extern DailyStats stats;
-
-// ── forward declaration di funzioni definite in main.cpp ──
-bool tgSend(const String &msg);
 static bool sendNightlyReport();
-static void resetDailyStats();
+static inline void resetDailyStats();
 
 uint32_t computeDayId()
 {
