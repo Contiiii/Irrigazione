@@ -76,17 +76,38 @@ void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk)
 {
   if (!autoEnabled)
     return;
+
+  // Sensore disconnesso mentre il motore è attivo in AUTO → spegni subito
   if (!sensoreOk)
+  {
+    if (az.active)
+    {
+      az.active = false;
+      spegniMotori((int)m);
+      logLine(WARN, "⚠️ AUTO STOP motore " + motorLabel((int)m) + ": sensore disconnesso", true, true);
+    }
     return;
+  }
 
   if (!irrigazioneConsentita())
+  {
+    // Blocco meteo durante irrigazione AUTO → spegni
+    if (az.active)
+    {
+      az.active = false;
+      spegniMotori((int)m);
+      logLine(WARN, "🌧️ AUTO STOP motore " + motorLabel((int)m) + ": irrigazione non consentita", true, true);
+    }
     return;
+  }
 
   const bool motOn = (m == Motore_1) ? (offTimeMot1 != 0) : (offTimeMot2 != 0);
 
+  // Motore acceso da fonte esterna (manuale) → non interferire
   if (motOn && !az.active)
     return;
 
+  // Motore spento esternamente mentre AUTO era attiva → riallinea
   if (az.active && !motOn)
   {
     az.active = false;
@@ -94,6 +115,7 @@ void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk)
     return;
   }
 
+  // Umidità sotto soglia → avvia irrigazione
   if (!az.active && humPct <= az.startTh)
   {
     uint8_t motB = 0;
@@ -110,6 +132,7 @@ void autoTickZone(AutoZone &az, MotorSel m, uint8_t humPct, bool sensoreOk)
     return;
   }
 
+  // Umidità sopra soglia stop → ferma irrigazione
   if (az.active && humPct >= az.stopTh)
   {
     az.active = false;
