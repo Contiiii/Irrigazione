@@ -153,32 +153,10 @@ void loop()
 
   // Spegnimento motori + blocco sicurezza
   if (offTimeMot1 && (int32_t)(now - offTimeMot1) >= 0)
-  {
-    uint32_t runS = 0;
-    if (health.motore1StartTime != 0)
-      runS = (now - health.motore1StartTime) / 1000UL;
-    spegniMotori(1);
-    if (runS >= MAX_MOTOR_SECONDS && !health.motore1BloccatoSicurezza)
-    {
-      health.motore1BloccatoSicurezza = true;
-      health.motore1AttivoTroppoTempo = true;
-      logLine(ERROR_L, "🚨🚫 MOTORE 1 BLOCCATO (timeout) - Usa sblocca1", true, true);
-    }
-  }
+  spegniMotori(1);
 
-  if (offTimeMot2 && (int32_t)(now - offTimeMot2) >= 0)
-  {
-    uint32_t runS = 0;
-    if (health.motore2StartTime != 0)
-      runS = (now - health.motore2StartTime) / 1000UL;
-    spegniMotori(2);
-    if (runS >= MAX_MOTOR_SECONDS && !health.motore2BloccatoSicurezza)
-    {
-      health.motore2BloccatoSicurezza = true;
-      health.motore2AttivoTroppoTempo = true;
-      logLine(ERROR_L, "🚨🚫 MOTORE 2 BLOCCATO (timeout) - Usa sblocca2", true, true);
-    }
-  }
+if (offTimeMot2 && (int32_t)(now - offTimeMot2) >= 0)
+  spegniMotori(2);
 
   handleTelnet();
 
@@ -197,14 +175,17 @@ void loop()
   }
 
   // Sensori umidità
-  uint32_t sensInterval = motorsOnNow() ? SENS_IRR_MS : SENS_BASE_MS;
-  if (debug)
-    logLine(DEBUG_L, "DBG off1=" + String(offTimeMot1) + " off2=" + String(offTimeMot2) + " " + String(sensInterval), true, false);
-  if (now - lastSensors >= sensInterval)
-  {
-    lastSensors = now;
-    handleSensore(false);
-  }
+  // CORRETTO — log solo quando scatta il check sensori:
+uint32_t sensInterval = motorsOnNow() ? SENS_IRR_MS : SENS_BASE_MS;
+if (now - lastSensors >= sensInterval)
+{
+  lastSensors = now;
+  if (debug)  // ← spostato qui
+    logLine(DEBUG_L, "DBG off1=" + String(offTimeMot1) +
+            " off2=" + String(offTimeMot2) +
+            " interval=" + String(sensInterval), true, false);
+  handleSensore(false);
+}
 
   // Ora locale (aggiornata ogni 60s)
   if (timeReady && (now - lastHour >= 60000))

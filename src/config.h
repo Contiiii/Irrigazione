@@ -72,7 +72,6 @@ constexpr uint8_t CHECK_TEMP = 30;
 constexpr uint8_t CHECK_WIFI = 10;
 constexpr uint16_t CHECK_MEMORY = 300;
 constexpr uint8_t CHECK_MOTOR = 5;
-constexpr uint8_t CHECK_TELEGRAM = 60;
 
 constexpr uint32_t SENS_BASE_MS = 20000UL;
 constexpr uint32_t SENS_IRR_MS = 3000UL;
