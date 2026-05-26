@@ -29,14 +29,14 @@ void leggiSensori(int umidita[2])
   {
     sum1 += analogRead(Pin_Sensore1);
     sum2 += analogRead(Pin_Sensore2);
-    delay(SENSOR_SAMPLE_DELAY_MS); // Piccolo ritardo tra letture
+    delay(SENSOR_SAMPLE_DELAY_MS);
   }
 
-  // ✅ Calcola media
   umidita[0] = sum1 / SENSOR_NUM_SAMPLES;
   umidita[1] = sum2 / SENSOR_NUM_SAMPLES;
 
-  validazioneSensori(umidita[0], umidita[1]);
+  uint8_t toStop = validazioneSensori(umidita[0], umidita[1]);
+  if (toStop) spegniMotori(toStop);
 }
 
 void handleSensore(bool toTelegram)

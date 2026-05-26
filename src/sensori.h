@@ -13,11 +13,6 @@ String umiditaStatusEmoji(int um);
 // Pre-condizione: array umidita[2] passato dal chiamante.
 void leggiSensori(int umidita[2]);
 
-// Valida i valori raw e aggiorna health flags.
-// Esegue anche spegniMotori() se un sensore risulta disconnesso.
-// Nota: usa extern spegniMotori() definita in main.cpp - da ripulire.
-void validazioneSensori(int raw1, int raw2);
-
 // Legge sensori, costruisce messaggio stato, gestisce irrigazione AUTO.
 // Se toTelegram=true, invia il report via Telegram.
 void handleSensore(bool toTelegram);

@@ -173,7 +173,7 @@ void handleHealth()
   tgSend(String(buf));
 }
 
-void validazioneSensori(int raw1, int raw2)
+uint8_t validazioneSensori(int raw1, int raw2)
 {
   static bool lastSensor1Error = false;
   static bool lastSensor2Error = false;
@@ -184,17 +184,14 @@ void validazioneSensori(int raw1, int raw2)
   if (sensor1Error && !lastSensor1Error)
   {
     health.sensore1Disconnesso = true;
-    // TODO Fase 5: sostituire questa chiamata diretta con flag di ritorno
-    // per eliminare la dipendenza ciclica sensori → motori prima dell'estrazione
-    spegniMotori(1);
+    lastSensor1Error = true;
     logLine(WARN, "⚠️ Sensore 1 disconnesso (val: " + String(raw1) + ")", true, true);
+    return 1;
   }
-
   else if (!sensor1Error)
   {
     health.sensore1Disconnesso = false;
   }
-
   lastSensor1Error = sensor1Error;
 
   // Sensore 2
@@ -203,39 +200,36 @@ void validazioneSensori(int raw1, int raw2)
   if (sensor2Error && !lastSensor2Error)
   {
     health.sensore2Disconnesso = true;
-    // TODO Fase 5: sostituire questa chiamata diretta con flag di ritorno
-    // per eliminare la dipendenza ciclica sensori → motori prima dell'estrazione
-    spegniMotori(2);
+    lastSensor2Error = true;
     logLine(WARN, "⚠️ Sensore 2 disconnesso (val: " + String(raw2) + ")", true, true);
+    return 2;
   }
   else if (!sensor2Error)
   {
     health.sensore2Disconnesso = false;
   }
-
   lastSensor2Error = sensor2Error;
 
-  // check umidita critica
+  // Check umidità critica
   if (!sensor1Error && !sensor2Error)
   {
     int pct1 = map(constrain(raw1, SENSOR_WET_ADC, SENSOR_DRY_ADC), SENSOR_DRY_ADC, SENSOR_WET_ADC, 0, 100);
     int pct2 = map(constrain(raw2, SENSOR_WET_ADC, SENSOR_DRY_ADC), SENSOR_DRY_ADC, SENSOR_WET_ADC, 0, 100);
 
-    // Umidità sotto 15% su ALMENO UN sensore? → CRITICA
     bool critica = (pct1 < UMIDITA_CRITICA || pct2 < UMIDITA_CRITICA);
 
-    // Se NUOVA condizione critica → Logga allarme
     if (critica && !health.umiditaCritica)
     {
       health.umiditaCritica = true;
       logLine(ERROR_L, "🚨 UMIDITA' CRITICA: Sens1=" + String(pct1) + "% Sens2=" + String(pct2) + "%", true, true);
     }
-    // Se umidità torna OK → Resetta flag
     else if (!critica)
     {
       health.umiditaCritica = false;
     }
   }
+
+  return 0;
 }
 
 void checkTemperaturaESP32(uint32_t now)
