@@ -362,6 +362,78 @@ void handleMessage(String text, String chatId, String messageId)
     return;
   }
 
+    if (text == "/auto" || text == "/auto on" || text == "/auto off")
+  {
+    if (text == "/auto on")
+    {
+      autoEnabled = true;
+      tgSend("🤖 AUTO: ON");
+      logLine(INFO, "🤖 AUTO abilitata", true, false);
+    }
+    else if (text == "/auto off")
+    {
+      autoEnabled = false;
+      tgSend("🤖 AUTO: OFF");
+      logLine(INFO, "🤖 AUTO disabilitata", true, false);
+    }
+    else
+    {
+      // /auto senza parametri → status
+      String msg = "🤖 AUTO: ";
+      msg += autoEnabled ? "ON" : "OFF";
+      msg += "\n\n🌱 Zona 1:\n";
+      msg += "  start ≤ " + String(az1.startTh) + "%\n";
+      msg += "  stop  ≥ " + String(az1.stopTh)  + "%\n";
+      msg += "  attiva: ";
+      msg += az1.active ? "SI ✅" : "NO";
+      msg += "\n\n🌱 Zona 2:\n";
+      msg += "  start ≤ " + String(az2.startTh) + "%\n";
+      msg += "  stop  ≥ " + String(az2.stopTh)  + "%\n";
+      msg += "  attiva: ";
+      msg += az2.active ? "SI ✅" : "NO";
+      tgSend(msg);
+    }
+    return;
+  }
+
+  if (text.startsWith("/soglie1 ") || text.startsWith("/soglie2 "))
+  {
+    const bool isZona1 = text.startsWith("/soglie1");
+    AutoZone &az = isZona1 ? az1 : az2;
+    const int zona = isZona1 ? 1 : 2;
+
+    // Parsing: "/soglie1 30 60"
+    int spaceA = text.indexOf(' ');
+    int spaceB = text.indexOf(' ', spaceA + 1);
+
+    if (spaceA < 0 || spaceB < 0)
+    {
+      tgSend("❌ Uso: /soglie" + String(zona) + " [start%] [stop%]\nEsempio: /soglie" + String(zona) + " 30 60");
+      return;
+    }
+
+    int newStart = text.substring(spaceA + 1, spaceB).toInt();
+    int newStop  = text.substring(spaceB + 1).toInt();
+
+    if (newStart < 5 || newStart > 95 || newStop < 5 || newStop > 95)
+    {
+      tgSend("❌ Valori fuori range (5-95%)");
+      return;
+    }
+    if (newStop <= newStart)
+    {
+      tgSend("❌ stop% deve essere > start%");
+      return;
+    }
+
+    az.startTh = (uint8_t)newStart;
+    az.stopTh  = (uint8_t)newStop;
+
+    tgSend("✅ Zona " + String(zona) + " aggiornata:\n  start ≤ " + String(newStart) + "%\n  stop  ≥ " + String(newStop) + "%");
+    logLine(INFO, "Soglie zona " + String(zona) + " → start=" + String(newStart) + " stop=" + String(newStop), true, false);
+    return;
+  }
+
   logLine(INFO, String("Comando sconosciuto: ") + text, true, true);
 }
 
