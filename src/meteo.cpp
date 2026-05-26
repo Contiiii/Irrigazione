@@ -21,11 +21,8 @@ bool rilevoMeteo()
 
   String url;
   url.reserve(256);
-  url = "https://api.openweathermap.org/data/2.5/weather?q=";
-  url += CITY;
-  url += "&appid=";
-  url += openWeatherMapApiKey;
-  url += "&units=metric&lang=it";
+url = "https://api.openweathermap.org/data/2.5/forecast?q=" + String(CITY) +
+      "&appid=" + openWeatherMapApiKey + "&units=metric&lang=it&cnt=3";
 
   HTTPClient http;
   http.setTimeout(8000);
@@ -143,7 +140,7 @@ bool irrigazioneConsentita()
 
 void handleMeteo()
 {
-  aggiornamentoMeteoServe();
+  aggiornamentoMeteoServe(false);
   aggiornamentoForecastServe(false);
   applicaBloccoDaForecast();
 
@@ -332,11 +329,10 @@ bool rilevoForecastPioggia()
 
 void applicaBloccoDaForecast()
 {
-  controlloBloccoPioggia(); // se era scaduto lo pulisce [file:603]
+  controlloBloccoPioggia();
   if (!meteo.forecastValidi)
     return;
 
-  // Se pioggia prevista entro 3h o 6h, attiva blocco fino a fine finestra
   unsigned long durataMs = 0;
   if (meteo.pioggiaPrevista3h)
     durataMs = 3UL * 60UL * 60UL * 1000UL;
@@ -345,7 +341,14 @@ void applicaBloccoDaForecast()
 
   if (durataMs > 0)
   {
-    bloccoIrrigazione = true;
-    scadenzaBloccoIrrigazione = millis() + durataMs;
+    const unsigned long nuovaScadenza = millis() + durataMs;
+    // Aggiorna solo se la nuova scadenza è più lontana
+    if (!bloccoIrrigazione || nuovaScadenza > scadenzaBloccoIrrigazione)
+    {
+      bloccoIrrigazione = true;
+      scadenzaBloccoIrrigazione = nuovaScadenza;
+      logLine(INFO, "🌧️ Blocco forecast attivato: " +
+              String(durataMs / 60000UL) + " min", true, true);
+    }
   }
 }
