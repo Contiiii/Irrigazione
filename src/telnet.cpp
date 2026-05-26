@@ -117,14 +117,23 @@ void handleTelnetCommand(const String &cmd)
       n = 50;
     telnetSendTail(LOG_FILE, n);
   }
-  else if (cmd == "tgreset")
-  {
-    lastHandledUpdateId = 0;
-    lastHandledUpdateIdRTC = 0;
-    tgBusy = false;
-    client.stop();
-    telnetClient.println("OK - Telegram offset reset to 0");
-  }
+  // FIX 2 — health su canale telnet invece di Telegram
+else if (cmd == "health")
+{
+  // Stampa health direttamente sul client Telnet
+  telnetClient.println("\n-- HEALTH --");
+  telnetClient.println("Mot1 bloccato: " + String(health.motore1BloccatoSicurezza));
+  telnetClient.println("Mot2 bloccato: " + String(health.motore2BloccatoSicurezza));
+  telnetClient.println("Mot1 troppo tempo: " + String(health.motore1AttivoTroppoTempo));
+  telnetClient.println("Mot2 troppo tempo: " + String(health.motore2AttivoTroppoTempo));
+  telnetClient.println("Irr oggi mot1: " + String(health.irrigazioniOggiMot1));
+  telnetClient.println("Irr oggi mot2: " + String(health.irrigazioniOggiMot2));
+  telnetClient.println("SPIFFS OK: " + String(spiffsOK));
+  telnetClient.println("Meteo valido: " + String(meteo.datiValidi));
+  telnetClient.println("Sta piovendo: " + String(meteo.staPiovendo));
+  telnetClient.println("Blocco irr: " + String(bloccoIrrigazione));
+  telnetClient.println("-- END HEALTH --");
+}
   else if (cmd == "clear")
   {
     SPIFFS.remove(LOG_FILE);
@@ -163,7 +172,7 @@ void handleTelnet()
     WiFiClient newClient = telnetServer.available();
     if (newClient)
     {
-      boostPolling(BOOST_TELNET_MS);
+      boostPolling(BOOST_TELNET_MS);  // boost solo alla connessione
       if (telnetClient && telnetClient.connected())
         telnetClient.stop();
       telnetClient = newClient;
@@ -172,13 +181,11 @@ void handleTelnet()
     }
   }
 
+  // FIX 3 — un solo controllo
   if (!(telnetClient && telnetClient.connected()))
     return;
 
-  if (telnetClient && telnetClient.connected())
-  {
-    boostPolling(2000);
-  }
+  // FIX 1 — boost rimosso da qui (era chiamato ogni loop)
 
   while (telnetClient.available())
   {
@@ -186,15 +193,11 @@ void handleTelnet()
 
     if (c == 0xFF)
     {
-      if (telnetClient.available())
-        telnetClient.read();
-      if (telnetClient.available())
-        telnetClient.read();
+      if (telnetClient.available()) telnetClient.read();
+      if (telnetClient.available()) telnetClient.read();
       continue;
     }
-
-    if (c == 0x00)
-      continue;
+    if (c == 0x00) continue;
 
     if (c == '\r' || c == '\n')
     {

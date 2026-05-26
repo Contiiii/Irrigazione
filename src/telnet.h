@@ -5,6 +5,7 @@
 #include "config.h"
 #include "health.h"
 #include "telegram.h"
+#include "meteo.h"
 
 // telnetOnNow() è definita inline in utils.h
 // telnetClient è in utils.h
@@ -15,6 +16,8 @@ extern String telnetLine;
 extern long lastHandledUpdateId;
 extern long lastHandledUpdateIdRTC;
 extern volatile bool tgBusy;
+extern bool bloccoIrrigazione;
+
 
 // Gestione Telnet
 void handleTelnet();
